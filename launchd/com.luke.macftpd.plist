@@ -1,0 +1,29 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "https://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+  <key>Label</key>
+  <string>com.luke.macftpd</string>
+  <key>ProgramArguments</key>
+  <array>
+    <string>/opt/macftpd/bin/macftpd</string>
+    <string>-config</string>
+    <string>/opt/macftpd/config.json</string>
+  </array>
+  <key>WorkingDirectory</key>
+  <string>/opt/macftpd</string>
+  <key>RunAtLoad</key>
+  <true/>
+  <key>KeepAlive</key>
+  <true/>
+  <key>StandardOutPath</key>
+  <string>/opt/macftpd/var/macftpd.log</string>
+  <key>StandardErrorPath</key>
+  <string>/opt/macftpd/var/macftpd.err.log</string>
+  <key>EnvironmentVariables</key>
+  <dict>
+    <key>MACFTPD_STORAGE_ROOT</key>
+    <string>/srv/macftpd/ftpd</string>
+  </dict>
+</dict>
+</plist>

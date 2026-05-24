@@ -1,0 +1,12 @@
+{
+  "$schema": "https://json.schemastore.org/wrangler.json",
+  "name": "macftpd-public-cache",
+  "main": "./worker.js",
+  "compatibility_date": "2026-05-17",
+  "routes": [
+    {
+      "pattern": "ftp.example.com/*",
+      "zone_name": "example.com"
+    }
+  ]
+}

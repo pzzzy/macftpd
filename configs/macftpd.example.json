@@ -1,0 +1,40 @@
+{
+  "ftp": {
+    "listen": "0.0.0.0:2121",
+    "passive_ports": "50000-50100",
+    "external_ip": "auto",
+    "auto_map": true,
+    "nat_gateway": "",
+    "mapping_lifetime": "1h",
+    "allow_active": true,
+    "allow_fxp": false,
+    "idle_timeout": "10m",
+    "welcome": "macftpd ready"
+  },
+  "http": {
+    "listen": "0.0.0.0:8080",
+    "public_base_url": "",
+    "session_key": "change-this-long-random-session-key",
+    "public_cache_control": "public, max-age=300, stale-while-revalidate=60",
+    "read_timeout": "10s",
+    "write_timeout": "60s"
+  },
+  "storage": {
+    "root": "/tmp/macftpd/ftpd",
+    "public_dir": "public",
+    "dropbox_dir": "dropboxes",
+    "ignore": [".DS_Store", "._*", ".AppleDouble", ".Spotlight-V100", ".Trashes", ".fseventsd", ".TemporaryItems", ".apdisk", ".git", ".svn", ".hg", ".env", ".ssh"]
+  },
+  "auth": {
+    "users_path": "/tmp/macftpd/users.json",
+    "bootstrap_admin_user": "admin",
+    "bootstrap_admin_pass": "change-this-password"
+  },
+  "cloudflare": {
+    "enabled": false,
+    "zone_id": "",
+    "api_token": "",
+    "cache_tag": "macftpd-public",
+    "http_proxy": true
+  }
+}
