@@ -9,6 +9,7 @@ ADMIN_USER="${ADMIN_USER:-admin}"
 INTERVAL="${INTERVAL:-60}"
 LOG_PATH="${LOG_PATH:-${APP_DIR}/var/monitor.log}"
 ENV_PATH="${ENV_PATH:-${APP_DIR}/var/monitor.env}"
+SUMMARY_INTERVAL="${SUMMARY_INTERVAL:-3600}"
 
 if [[ -f "${ENV_PATH}" ]]; then
   # shellcheck source=/dev/null
@@ -21,12 +22,17 @@ if [[ -z "${ADMIN_PASS:-}" ]]; then
 fi
 
 mkdir -p "$(dirname "${LOG_PATH}")"
+STATE_DIR="${APP_DIR}/var/monitor-state"
+mkdir -p "${STATE_DIR}"
+LAST_STATUS_PATH="${STATE_DIR}/last-status"
+LAST_SUMMARY_PATH="${STATE_DIR}/last-summary"
 
 while true; do
   ts="$(date -u +%Y-%m-%dT%H:%M:%SZ)"
+  now="$(date -u +%s)"
   status="ok"
+  output_path="$(mktemp "${STATE_DIR}/probe.XXXXXX")"
   {
-    echo "=== ${ts} ==="
     if ! curl -fsS --max-time 10 "http://${HOST}:${HTTP_PORT}/healthz"; then
       status="fail"
       echo "http health failed"
@@ -65,6 +71,34 @@ PY
       echo "ftp probe failed"
     fi
     echo "status=${status}"
-  } >>"${LOG_PATH}" 2>&1
+  } >"${output_path}" 2>&1
+
+  last_status="$(cat "${LAST_STATUS_PATH}" 2>/dev/null || true)"
+  last_summary="$(cat "${LAST_SUMMARY_PATH}" 2>/dev/null || echo 0)"
+  should_log=0
+  if [[ "${status}" != "ok" ]]; then
+    should_log=1
+  elif [[ "${last_status}" == "fail" ]]; then
+    should_log=1
+  elif (( now - last_summary >= SUMMARY_INTERVAL )); then
+    should_log=1
+  fi
+
+  if (( should_log )); then
+    {
+      echo "=== ${ts} ==="
+      if [[ "${status}" == "ok" && "${last_status}" == "fail" ]]; then
+        echo "recovered"
+      fi
+      if [[ "${status}" == "ok" ]]; then
+        echo "status=ok"
+        echo "${now}" >"${LAST_SUMMARY_PATH}"
+      else
+        cat "${output_path}"
+      fi
+    } >>"${LOG_PATH}" 2>&1
+  fi
+  rm -f "${output_path}"
+  printf '%s\n' "${status}" >"${LAST_STATUS_PATH}"
   sleep "${INTERVAL}"
 done

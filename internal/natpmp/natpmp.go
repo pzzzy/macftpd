@@ -87,6 +87,11 @@ func (c Client) MapTCP(ctx context.Context, internalPort, externalPort int, life
 	}, nil
 }
 
+func (c Client) DeleteTCP(ctx context.Context, internalPort, externalPort int) error {
+	_, err := c.MapTCP(ctx, internalPort, externalPort, 0)
+	return err
+}
+
 func MaintainTCP(ctx context.Context, gateway string, ports []int, lifetime time.Duration, setExternalIP func(string)) {
 	if gateway == "" {
 		discovered, err := DiscoverGateway()

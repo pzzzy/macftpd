@@ -27,6 +27,9 @@ type FTPConfig struct {
 	AutoMap         bool     `json:"auto_map"`
 	NATGateway      string   `json:"nat_gateway"`
 	MappingLifetime Duration `json:"mapping_lifetime"`
+	TLSCertFile     string   `json:"tls_cert_file"`
+	TLSKeyFile      string   `json:"tls_key_file"`
+	RequireTLS      bool     `json:"require_tls"`
 	AllowActive     bool     `json:"allow_active"`
 	AllowFXP        bool     `json:"allow_fxp"`
 	IdleTimeout     Duration `json:"idle_timeout"`
@@ -39,6 +42,8 @@ type HTTPConfig struct {
 	PublicBaseURL      string   `json:"public_base_url"`
 	SessionKey         string   `json:"session_key"`
 	PublicCacheControl string   `json:"public_cache_control"`
+	TurnstileSiteKey   string   `json:"turnstile_site_key"`
+	TurnstileSecret    string   `json:"turnstile_secret"`
 	ReadTimeout        Duration `json:"read_timeout"`
 	WriteTimeout       Duration `json:"write_timeout"`
 }
@@ -117,7 +122,7 @@ func Default() Config {
 			Root:       "./var/ftpd",
 			PublicDir:  "public",
 			DropboxDir: "dropboxes",
-			Ignore:     []string{".DS_Store", "._*", ".AppleDouble", ".Spotlight-V100", ".Trashes", ".fseventsd", ".TemporaryItems", ".apdisk", ".git", ".svn", ".hg", ".env", ".ssh"},
+			Ignore:     []string{".DS_Store", "._*", ".AppleDouble", ".Spotlight-V100", ".Trashes", ".fseventsd", ".TemporaryItems", ".apdisk", ".git", ".svn", ".hg", ".env", ".ssh", "._macftpd_trash", "._macftpd_versions"},
 		},
 		Auth: AuthConfig{
 			UsersPath:          "./var/users.json",
@@ -201,6 +206,10 @@ func (c *Config) Normalize() error {
 	}
 	c.Cloudflare.ZoneID = strings.TrimSpace(c.Cloudflare.ZoneID)
 	c.Cloudflare.APIToken = strings.TrimSpace(c.Cloudflare.APIToken)
+	c.FTP.TLSCertFile = strings.TrimSpace(c.FTP.TLSCertFile)
+	c.FTP.TLSKeyFile = strings.TrimSpace(c.FTP.TLSKeyFile)
+	c.HTTP.TurnstileSiteKey = strings.TrimSpace(c.HTTP.TurnstileSiteKey)
+	c.HTTP.TurnstileSecret = strings.TrimSpace(c.HTTP.TurnstileSecret)
 	return nil
 }
 
@@ -225,6 +234,8 @@ func applyEnv(c *Config) {
 		"MACFTPD_FTP_PASSIVE":      &c.FTP.PassivePorts,
 		"MACFTPD_FTP_EXTERNAL_IP":  &c.FTP.ExternalIP,
 		"MACFTPD_FTP_NAT_GATEWAY":  &c.FTP.NATGateway,
+		"MACFTPD_FTP_TLS_CERT":     &c.FTP.TLSCertFile,
+		"MACFTPD_FTP_TLS_KEY":      &c.FTP.TLSKeyFile,
 		"MACFTPD_HTTP_LISTEN":      &c.HTTP.Listen,
 		"MACFTPD_STORAGE_ROOT":     &c.Storage.Root,
 		"MACFTPD_USERS_PATH":       &c.Auth.UsersPath,
@@ -236,6 +247,8 @@ func applyEnv(c *Config) {
 		"MACFTPD_CACHE_CONTROL":    &c.HTTP.PublicCacheControl,
 		"MACFTPD_CLOUDFLARE_TAG":   &c.Cloudflare.CacheTag,
 		"MACFTPD_HTTP_SESSION_KEY": &c.HTTP.SessionKey,
+		"MACFTPD_TURNSTILE_SITE":   &c.HTTP.TurnstileSiteKey,
+		"MACFTPD_TURNSTILE_SECRET": &c.HTTP.TurnstileSecret,
 	}
 	for name, dest := range env {
 		if v := strings.TrimSpace(os.Getenv(name)); v != "" {
@@ -244,6 +257,9 @@ func applyEnv(c *Config) {
 	}
 	if os.Getenv("MACFTPD_CF_ENABLED") == "1" {
 		c.Cloudflare.Enabled = true
+	}
+	if os.Getenv("MACFTPD_FTP_REQUIRE_TLS") == "1" {
+		c.FTP.RequireTLS = true
 	}
 }
 

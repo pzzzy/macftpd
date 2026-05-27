@@ -3,6 +3,7 @@ package ftpserver
 import (
 	"bufio"
 	"context"
+	"crypto/tls"
 	"errors"
 	"fmt"
 	"io"
@@ -19,7 +20,9 @@ import (
 	"macftpd/internal/config"
 	"macftpd/internal/natpmp"
 	"macftpd/internal/ratelimit"
+	"macftpd/internal/status"
 	"macftpd/internal/storage"
+	"macftpd/internal/upnpigd"
 )
 
 type Server struct {
@@ -36,8 +39,12 @@ type Server struct {
 	externalIP string
 	natMu      sync.Mutex
 	natGateway string
+	upnpMu     sync.Mutex
+	upnpClient *upnpigd.Client
 	limiter    *ratelimit.Limiter
 	activity   *activity.Store
+	tracker    *status.Tracker
+	tlsConfig  *tls.Config
 }
 
 type session struct {
@@ -52,18 +59,33 @@ type session struct {
 	cwd           string
 	typ           string
 	passive       net.Listener
+	passivePort   int
 	activeAddr    string
 	renameFrom    string
 	restartOffset int64
 	restartSet    bool
+	secure        bool
+	protPrivate   bool
+	statusID      int64
 }
 
-func New(cfg config.FTPConfig, store *auth.Store, root *storage.Root, activityLog *activity.Store) (*Server, error) {
+func New(cfg config.FTPConfig, store *auth.Store, root *storage.Root, activityLog *activity.Store, tracker *status.Tracker) (*Server, error) {
 	ports, err := parsePorts(cfg.PassivePorts)
 	if err != nil {
 		return nil, err
 	}
-	return &Server{cfg: cfg, auth: store, root: root, ports: ports, limiter: ratelimit.New(5, 10*time.Minute, 5*time.Minute), activity: activityLog}, nil
+	var tlsConfig *tls.Config
+	if cfg.TLSCertFile != "" || cfg.TLSKeyFile != "" {
+		if cfg.TLSCertFile == "" || cfg.TLSKeyFile == "" {
+			return nil, errors.New("both ftp.tls_cert_file and ftp.tls_key_file are required for FTPS")
+		}
+		cert, err := tls.LoadX509KeyPair(cfg.TLSCertFile, cfg.TLSKeyFile)
+		if err != nil {
+			return nil, err
+		}
+		tlsConfig = &tls.Config{Certificates: []tls.Certificate{cert}, MinVersion: tls.VersionTLS12}
+	}
+	return &Server{cfg: cfg, auth: store, root: root, ports: ports, limiter: ratelimit.New(5, 10*time.Minute, 5*time.Minute), activity: activityLog, tracker: tracker, tlsConfig: tlsConfig}, nil
 }
 
 func (s *Server) ListenAndServe(ctx context.Context) error {
@@ -82,6 +104,7 @@ func (s *Server) ListenAndServe(ctx context.Context) error {
 			ports = append(ports, tcp.Port)
 		}
 		go natpmp.MaintainTCP(ctx, s.cfg.NATGateway, ports, s.cfg.MappingLifetime.Std(time.Hour), s.setMappedExternalIP)
+		go s.maintainUPnPTCP(ctx, ports)
 	}
 	go func() {
 		<-ctx.Done()
@@ -119,7 +142,11 @@ func (s *Server) Addr() string {
 
 func (s *Server) handle(conn net.Conn) {
 	idle := s.cfg.IdleTimeout.Std(10 * time.Minute)
-	ss := &session{server: s, conn: conn, reader: bufio.NewReader(conn), writer: bufio.NewWriter(conn), cwd: "/", typ: "A"}
+	statusID := int64(0)
+	if s.tracker != nil {
+		statusID = s.tracker.Add("ftp", conn.RemoteAddr().String())
+	}
+	ss := &session{server: s, conn: conn, reader: bufio.NewReader(conn), writer: bufio.NewWriter(conn), cwd: "/", typ: "A", statusID: statusID}
 	defer ss.close()
 	ss.reply(220, s.cfg.Welcome)
 	for {
@@ -148,6 +175,10 @@ func (s *session) dispatch(cmd, arg string) bool {
 		s.username = strings.TrimSpace(arg)
 		s.reply(331, "Password required")
 	case "PASS":
+		if s.server.cfg.RequireTLS && s.server.tlsConfig != nil && !s.secure {
+			s.reply(534, "TLS required")
+			return false
+		}
 		limitKey := s.loginLimitKey()
 		if !s.server.limiter.Allow(limitKey) {
 			s.logActivity("login", "limited", "", "", 0, "too many failed FTP login attempts")
@@ -169,12 +200,45 @@ func (s *session) dispatch(cmd, arg string) bool {
 			s.cwd = "/"
 		}
 		_ = s.server.root.EnsureUserHome(user)
+		s.updateStatus(func(st *status.Session) {
+			st.User = user.Username
+			st.Action = "idle"
+			st.Path = s.cwd
+			st.Secure = s.secure
+		})
 		s.logActivity("login", "ok", s.cwd, "", 0, "FTP login")
 		s.reply(230, "Login successful")
+	case "AUTH":
+		s.authTLS(arg)
+	case "PBSZ":
+		if !s.secure {
+			s.reply(503, "Send AUTH TLS first")
+			return false
+		}
+		s.reply(200, "PBSZ=0")
+	case "PROT":
+		if !s.secure {
+			s.reply(503, "Send AUTH TLS first")
+			return false
+		}
+		switch strings.ToUpper(strings.TrimSpace(arg)) {
+		case "P":
+			s.protPrivate = true
+			s.reply(200, "Data channel protection set to private")
+		case "C":
+			s.protPrivate = false
+			s.reply(200, "Data channel protection set to clear")
+		default:
+			s.reply(536, "Unsupported protection level")
+		}
 	case "SYST":
 		s.reply(215, "UNIX Type: L8")
 	case "FEAT":
-		s.multiline(211, []string{"UTF8", "EPSV", "PASV", "REST STREAM", "SIZE", "MDTM"}, "End")
+		features := []string{"UTF8", "EPSV", "PASV", "REST STREAM", "SIZE", "MDTM", "MLST type*;size*;modify*;perm*;", "MLSD"}
+		if s.server.tlsConfig != nil {
+			features = append(features, "AUTH TLS", "PBSZ", "PROT")
+		}
+		s.multiline(211, features, "End")
 	case "OPTS":
 		s.reply(200, "OK")
 	case "PWD", "XPWD":
@@ -231,6 +295,16 @@ func (s *session) dispatch(cmd, arg string) bool {
 			return false
 		}
 		s.list(arg, cmd == "NLST")
+	case "MLSD":
+		if !s.requireAuthPerm(s.perms.List, "list") {
+			return false
+		}
+		s.mlsd(arg)
+	case "MLST":
+		if !s.requireAuthPerm(s.perms.List, "list") {
+			return false
+		}
+		s.mlst(arg)
 	case "RETR":
 		if !s.requireAuthPerm(s.perms.Download, "download") {
 			return false
@@ -299,7 +373,35 @@ func (s *session) changeDir(arg string) {
 		return
 	}
 	s.cwd = virtual
+	s.updateStatus(func(st *status.Session) { st.Path = s.cwd })
 	s.reply(250, "Directory changed")
+}
+
+func (s *session) authTLS(arg string) {
+	if s.server.tlsConfig == nil {
+		s.reply(502, "TLS not configured")
+		return
+	}
+	if s.secure {
+		s.reply(503, "TLS already active")
+		return
+	}
+	if upper := strings.ToUpper(strings.TrimSpace(arg)); upper != "TLS" && upper != "SSL" {
+		s.reply(504, "Use AUTH TLS")
+		return
+	}
+	s.reply(234, "Starting TLS")
+	tlsConn := tls.Server(s.conn, s.server.tlsConfig)
+	if err := tlsConn.Handshake(); err != nil {
+		_ = s.conn.Close()
+		return
+	}
+	s.conn = tlsConn
+	s.reader = bufio.NewReader(tlsConn)
+	s.writer = bufio.NewWriter(tlsConn)
+	s.secure = true
+	s.protPrivate = true
+	s.updateStatus(func(st *status.Session) { st.Secure = true })
 }
 
 func (s *session) list(arg string, namesOnly bool) {
@@ -344,9 +446,60 @@ func (s *session) list(arg string, namesOnly bool) {
 	s.reply(226, "Transfer complete")
 }
 
+func (s *session) mlsd(arg string) {
+	realPath, virtual, err := s.server.root.Resolve(s.user, s.cwd, scrubListArg(arg))
+	if err != nil {
+		s.reply(550, "Path unavailable")
+		return
+	}
+	info, err := s.server.root.Stat(realPath)
+	if err != nil {
+		s.reply(550, "Path unavailable")
+		return
+	}
+	conn, err := s.openData()
+	if err != nil {
+		s.reply(425, "Cannot open data connection")
+		return
+	}
+	defer conn.Close()
+	s.setDataDeadline(conn)
+	s.reply(150, "Opening data connection")
+	w := bufio.NewWriter(conn)
+	if info.IsDir() {
+		entries, err := s.server.root.ListForUser(s.user, realPath, virtual)
+		if err != nil {
+			s.reply(550, "List failed")
+			return
+		}
+		for _, entry := range entries {
+			fmt.Fprintf(w, "%s %s\r\n", mlsxFacts(entry), entry.Name)
+		}
+	} else {
+		fmt.Fprintf(w, "%s %s\r\n", mlsxFacts(storage.Entry{Name: info.Name(), Path: virtual, Size: info.Size(), Mode: info.Mode().String(), IsDir: info.IsDir(), ModTime: info.ModTime()}), info.Name())
+	}
+	_ = w.Flush()
+	s.reply(226, "Transfer complete")
+}
+
+func (s *session) mlst(arg string) {
+	realPath, virtual, err := s.server.root.Resolve(s.user, s.cwd, arg)
+	if err != nil {
+		s.reply(550, "Path unavailable")
+		return
+	}
+	info, err := s.server.root.Stat(realPath)
+	if err != nil {
+		s.reply(550, "Path unavailable")
+		return
+	}
+	entry := storage.Entry{Name: info.Name(), Path: virtual, Size: info.Size(), Mode: info.Mode().String(), IsDir: info.IsDir(), ModTime: info.ModTime()}
+	s.multiline(250, []string{fmt.Sprintf("%s %s", mlsxFacts(entry), virtual)}, "Listing")
+}
+
 func (s *session) retrieve(arg string) {
 	offset, restarting := s.consumeRestart()
-	realPath, _, err := s.server.root.Resolve(s.user, s.cwd, arg)
+	realPath, virtual, err := s.server.root.Resolve(s.user, s.cwd, arg)
 	if err != nil {
 		s.closeDataSetup()
 		s.reply(550, "Path unavailable")
@@ -384,8 +537,18 @@ func (s *session) retrieve(arg string) {
 	}
 	defer conn.Close()
 	s.setDataDeadline(conn)
+	s.updateStatus(func(st *status.Session) {
+		st.Action = "download"
+		st.Path = virtual
+		st.Mode = "retr"
+		st.Bytes = 0
+	})
 	s.reply(150, "Opening data connection")
 	n, err := io.Copy(conn, file)
+	s.updateStatus(func(st *status.Session) {
+		st.Action = "idle"
+		st.Bytes = n
+	})
 	if err != nil {
 		s.logActivity("download", "failed", arg, "", n, err.Error())
 		s.reply(426, "Transfer aborted")
@@ -406,7 +569,7 @@ func (s *session) store(arg string, appendMode bool) {
 		s.reply(503, "REST is not valid with APPE")
 		return
 	}
-	realPath, _, err := s.server.root.Resolve(s.user, s.cwd, arg)
+	realPath, virtual, err := s.server.root.Resolve(s.user, s.cwd, arg)
 	if err != nil {
 		s.closeDataSetup()
 		s.reply(550, "Path unavailable")
@@ -424,6 +587,11 @@ func (s *session) store(arg string, appendMode bool) {
 		flag = os.O_WRONLY
 	} else {
 		flag |= os.O_TRUNC
+	}
+	if !appendMode && !restarting {
+		if info, err := s.server.root.Stat(realPath); err == nil && !info.IsDir() {
+			_, _ = s.server.root.Version(realPath, virtual, s.user.Username)
+		}
 	}
 	if restarting && offset > 0 {
 		info, err := s.server.root.Stat(realPath)
@@ -464,8 +632,18 @@ func (s *session) store(arg string, appendMode bool) {
 	}
 	defer conn.Close()
 	s.setDataDeadline(conn)
+	s.updateStatus(func(st *status.Session) {
+		st.Action = "upload"
+		st.Path = virtual
+		st.Mode = "stor"
+		st.Bytes = 0
+	})
 	s.reply(150, "Opening data connection")
 	n, err := io.Copy(file, conn)
+	s.updateStatus(func(st *status.Session) {
+		st.Action = "idle"
+		st.Bytes = n
+	})
 	if err != nil {
 		s.logActivity("upload", "failed", arg, "", n, err.Error())
 		s.reply(426, "Transfer aborted")
@@ -502,7 +680,7 @@ func (s *session) consumeRestart() (int64, bool) {
 }
 
 func (s *session) delete(arg string) {
-	realPath, _, err := s.server.root.Resolve(s.user, s.cwd, arg)
+	realPath, virtual, err := s.server.root.Resolve(s.user, s.cwd, arg)
 	if err != nil {
 		s.reply(550, "Path unavailable")
 		return
@@ -511,12 +689,12 @@ func (s *session) delete(arg string) {
 		s.reply(550, "Permission denied: public files are admin-managed")
 		return
 	}
-	if err := s.server.root.Remove(realPath); err != nil {
+	if _, err := s.server.root.Trash(realPath, virtual, s.user.Username); err != nil {
 		s.logActivity("delete", "failed", arg, "", 0, err.Error())
 		s.reply(550, "Delete failed")
 		return
 	}
-	s.logActivity("delete", "ok", arg, "", 0, "FTP delete")
+	s.logActivity("delete", "ok", arg, "", 0, "FTP delete moved to trash")
 	s.reply(250, "Deleted")
 }
 
@@ -536,7 +714,7 @@ func (s *session) mkdir(arg string) {
 }
 
 func (s *session) rmdir(arg string) {
-	realPath, _, err := s.server.root.Resolve(s.user, s.cwd, arg)
+	realPath, virtual, err := s.server.root.Resolve(s.user, s.cwd, arg)
 	if err != nil {
 		s.reply(550, "Path unavailable")
 		return
@@ -545,12 +723,12 @@ func (s *session) rmdir(arg string) {
 		s.reply(550, "Permission denied: public folders are admin-managed")
 		return
 	}
-	if err := s.server.root.Remove(realPath); err != nil {
+	if _, err := s.server.root.Trash(realPath, virtual, s.user.Username); err != nil {
 		s.logActivity("delete", "failed", arg, "", 0, err.Error())
 		s.reply(550, "Remove failed")
 		return
 	}
-	s.logActivity("delete", "ok", arg, "", 0, "FTP folder removed")
+	s.logActivity("delete", "ok", arg, "", 0, "FTP folder moved to trash")
 	s.reply(250, "Removed")
 }
 
@@ -635,6 +813,7 @@ func (s *session) enterPassive(extended bool) {
 		log.Printf("natpmp: passive map tcp %d failed: %v", port, err)
 	}
 	s.passive = ln
+	s.passivePort = port
 	s.activeAddr = ""
 	if extended {
 		s.reply(229, fmt.Sprintf("Entering Extended Passive Mode (|||%d|)", port))
@@ -675,24 +854,70 @@ func (s *Server) mapPassivePort(port int) error {
 	if !s.cfg.AutoMap || s.isLoopbackListener() {
 		return nil
 	}
+	var errs []string
+	mapped := false
 	gateway, err := s.natGatewayAddress()
 	if err != nil {
-		return err
-	}
-	ctx, cancel := context.WithTimeout(context.Background(), 3*time.Second)
-	defer cancel()
-	client := natpmp.Client{Gateway: gateway, Timeout: 1200 * time.Millisecond}
-	if s.mappedExternalIP() == "" {
-		if ip, err := client.PublicAddress(ctx); err == nil {
-			s.setMappedExternalIP(ip.String())
+		errs = append(errs, fmt.Sprintf("natpmp gateway: %v", err))
+	} else {
+		ctx, cancel := context.WithTimeout(context.Background(), 3*time.Second)
+		client := natpmp.Client{Gateway: gateway, Timeout: 1200 * time.Millisecond}
+		if s.mappedExternalIP() == "" {
+			if ip, err := client.PublicAddress(ctx); err == nil {
+				s.setMappedExternalIP(ip.String())
+			}
+		}
+		mapping, err := client.MapTCP(ctx, port, port, s.cfg.MappingLifetime.Std(time.Hour))
+		cancel()
+		if err != nil {
+			errs = append(errs, fmt.Sprintf("natpmp: %v", err))
+		} else if mapping.ExternalPort != port {
+			errs = append(errs, fmt.Sprintf("natpmp external port %d does not match passive port %d", mapping.ExternalPort, port))
+		} else {
+			mapped = true
 		}
 	}
-	mapping, err := client.MapTCP(ctx, port, port, s.cfg.MappingLifetime.Std(time.Hour))
-	if err != nil {
-		return err
+	ctx, cancel := context.WithTimeout(context.Background(), 8*time.Second)
+	defer cancel()
+	if err := s.mapUPnPTCP(ctx, port); err != nil {
+		errs = append(errs, fmt.Sprintf("upnp: %v", err))
+	} else {
+		mapped = true
 	}
-	if mapping.ExternalPort != port {
-		return fmt.Errorf("external port %d does not match passive port %d", mapping.ExternalPort, port)
+	if !mapped && len(errs) > 0 {
+		return errors.New(strings.Join(errs, "; "))
+	}
+	return nil
+}
+
+func (s *Server) unmapPassivePort(port int) error {
+	if port <= 0 || !s.cfg.AutoMap || s.isLoopbackListener() {
+		return nil
+	}
+	var errs []string
+	unmapped := false
+	gateway, err := s.natGatewayAddress()
+	if err != nil {
+		errs = append(errs, fmt.Sprintf("natpmp gateway: %v", err))
+	} else {
+		ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
+		client := natpmp.Client{Gateway: gateway, Timeout: 1200 * time.Millisecond}
+		if err := client.DeleteTCP(ctx, port, port); err != nil {
+			errs = append(errs, fmt.Sprintf("natpmp: %v", err))
+		} else {
+			unmapped = true
+		}
+		cancel()
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	if err := s.deleteUPnPTCP(ctx, port); err != nil {
+		errs = append(errs, fmt.Sprintf("upnp: %v", err))
+	} else {
+		unmapped = true
+	}
+	cancel()
+	if !unmapped && len(errs) > 0 {
+		return errors.New(strings.Join(errs, "; "))
 	}
 	return nil
 }
@@ -721,6 +946,115 @@ func (s *Server) natGatewayAddress() (string, error) {
 	}
 	s.natGateway = gateway
 	return gateway, nil
+}
+
+func (s *Server) maintainUPnPTCP(ctx context.Context, ports []int) {
+	lifetime := s.cfg.MappingLifetime.Std(time.Hour)
+	if lifetime <= 0 {
+		lifetime = time.Hour
+	}
+	var lastFailureLog time.Time
+	var lastFailure string
+	var suppressedFailures int
+	for {
+		renewEvery := lifetime / 2
+		if renewEvery < 5*time.Minute {
+			renewEvery = 5 * time.Minute
+		}
+		hadFailure := false
+		for _, port := range ports {
+			attemptCtx, cancel := context.WithTimeout(ctx, 8*time.Second)
+			err := s.mapUPnPTCP(attemptCtx, port)
+			cancel()
+			if err != nil {
+				hadFailure = true
+				msg := fmt.Sprintf("upnp: map tcp %d failed: %v", port, err)
+				now := time.Now()
+				if msg != lastFailure || now.Sub(lastFailureLog) >= 30*time.Minute {
+					if suppressedFailures > 0 {
+						log.Printf("%s; suppressed %d repeated UPnP mapping failures", msg, suppressedFailures)
+					} else {
+						log.Print(msg)
+					}
+					lastFailure = msg
+					lastFailureLog = now
+					suppressedFailures = 0
+				} else {
+					suppressedFailures++
+				}
+			}
+		}
+		if hadFailure {
+			renewEvery = 5 * time.Minute
+		} else if len(ports) > 0 {
+			if suppressedFailures > 0 {
+				log.Printf("upnp: mapped %d tcp ports after suppressing %d repeated failures", len(ports), suppressedFailures)
+				suppressedFailures = 0
+			}
+			log.Printf("upnp: mapped %d tcp ports", len(ports))
+		}
+		timer := time.NewTimer(renewEvery)
+		select {
+		case <-ctx.Done():
+			timer.Stop()
+			return
+		case <-timer.C:
+		}
+	}
+}
+
+func (s *Server) mapUPnPTCP(ctx context.Context, port int) error {
+	client, err := s.upnp()
+	if err != nil {
+		return err
+	}
+	if s.mappedExternalIP() == "" {
+		if ip, err := client.PublicAddress(ctx); err == nil {
+			s.setMappedExternalIP(ip.String())
+		}
+	}
+	_, err = client.MapTCP(ctx, port, port, s.cfg.MappingLifetime.Std(time.Hour), "macftpd")
+	if err != nil {
+		s.clearUPnP(client)
+	}
+	return err
+}
+
+func (s *Server) deleteUPnPTCP(ctx context.Context, port int) error {
+	client, err := s.upnp()
+	if err != nil {
+		return err
+	}
+	err = client.DeleteTCP(ctx, port)
+	if err != nil {
+		s.clearUPnP(client)
+	}
+	return err
+}
+
+func (s *Server) upnp() (*upnpigd.Client, error) {
+	s.upnpMu.Lock()
+	defer s.upnpMu.Unlock()
+	if s.upnpClient != nil {
+		return s.upnpClient, nil
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), 8*time.Second)
+	defer cancel()
+	client, err := upnpigd.Discover(ctx)
+	if err != nil {
+		return nil, err
+	}
+	log.Printf("upnp: discovered %s service %s for local %s", client.ControlURL, client.ServiceType, client.LocalIP)
+	s.upnpClient = client
+	return client, nil
+}
+
+func (s *Server) clearUPnP(client *upnpigd.Client) {
+	s.upnpMu.Lock()
+	defer s.upnpMu.Unlock()
+	if s.upnpClient == client {
+		s.upnpClient = nil
+	}
 }
 
 func (s *Server) listenPassive() (int, net.Listener, error) {
@@ -803,17 +1137,71 @@ func (s *session) enterExtendedActive(arg string) {
 func (s *session) openData() (net.Conn, error) {
 	if s.passive != nil {
 		ln := s.passive
+		port := s.passivePort
 		s.passive = nil
+		s.passivePort = 0
 		defer ln.Close()
 		_ = ln.(*net.TCPListener).SetDeadline(time.Now().Add(30 * time.Second))
-		return ln.Accept()
+		conn, err := ln.Accept()
+		if err != nil {
+			if port > 0 {
+				s.releasePassivePort(port)
+			}
+			return nil, err
+		}
+		rawConn := conn
+		conn, err = s.protectDataConn(rawConn)
+		if err != nil {
+			_ = rawConn.Close()
+			if port > 0 {
+				s.releasePassivePort(port)
+			}
+			return nil, err
+		}
+		if port > 0 {
+			return &passiveDataConn{Conn: conn, release: func() { s.releasePassivePort(port) }}, nil
+		}
+		return conn, nil
 	}
 	if s.activeAddr != "" {
 		addr := s.activeAddr
 		s.activeAddr = ""
-		return net.DialTimeout("tcp", addr, 30*time.Second)
+		conn, err := net.DialTimeout("tcp", addr, 30*time.Second)
+		if err != nil {
+			return nil, err
+		}
+		return s.protectDataConn(conn)
 	}
 	return nil, errors.New("no data connection")
+}
+
+func (s *session) protectDataConn(conn net.Conn) (net.Conn, error) {
+	if !s.protPrivate || s.server.tlsConfig == nil {
+		return conn, nil
+	}
+	tlsConn := tls.Server(conn, s.server.tlsConfig)
+	if err := tlsConn.Handshake(); err != nil {
+		return nil, err
+	}
+	return tlsConn, nil
+}
+
+func (s *session) releasePassivePort(port int) {
+	if err := s.server.unmapPassivePort(port); err != nil {
+		log.Printf("natpmp: passive unmap tcp %d failed: %v", port, err)
+	}
+}
+
+type passiveDataConn struct {
+	net.Conn
+	once    sync.Once
+	release func()
+}
+
+func (c *passiveDataConn) Close() error {
+	err := c.Conn.Close()
+	c.once.Do(c.release)
+	return err
 }
 
 func (s *session) setDataDeadline(conn net.Conn) {
@@ -869,6 +1257,13 @@ func (s *session) logActivity(action, outcome, pathValue, destPath string, bytes
 	})
 }
 
+func (s *session) updateStatus(mutate func(*status.Session)) {
+	if s.server.tracker == nil || s.statusID == 0 {
+		return
+	}
+	s.server.tracker.Update(s.statusID, mutate)
+}
+
 func (s *session) reply(code int, msg string) {
 	fmt.Fprintf(s.writer, "%d %s\r\n", code, msg)
 	_ = s.writer.Flush()
@@ -885,6 +1280,9 @@ func (s *session) multiline(code int, lines []string, end string) {
 
 func (s *session) close() {
 	s.closePassive()
+	if s.server.tracker != nil && s.statusID != 0 {
+		s.server.tracker.Remove(s.statusID)
+	}
 	_ = s.conn.Close()
 }
 
@@ -892,6 +1290,11 @@ func (s *session) closePassive() {
 	if s.passive != nil {
 		_ = s.passive.Close()
 		s.passive = nil
+	}
+	if s.passivePort > 0 {
+		port := s.passivePort
+		s.passivePort = 0
+		s.releasePassivePort(port)
 	}
 }
 
@@ -924,6 +1327,16 @@ func formatList(name, mode string, size int64, mod time.Time) string {
 		prefix = "d"
 	}
 	return fmt.Sprintf("%srw-r--r-- 1 owner group %12d %s %s", prefix, size, mod.Format("Jan _2 15:04"), name)
+}
+
+func mlsxFacts(entry storage.Entry) string {
+	typ := "file"
+	perm := "r"
+	if entry.IsDir {
+		typ = "dir"
+		perm = "el"
+	}
+	return fmt.Sprintf("type=%s;size=%d;modify=%s;perm=%s;", typ, entry.Size, entry.ModTime.UTC().Format("20060102150405"), perm)
 }
 
 func parsePorts(spec string) ([]int, error) {

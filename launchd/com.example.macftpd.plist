@@ -3,7 +3,7 @@
 <plist version="1.0">
 <dict>
   <key>Label</key>
-  <string>com.luke.macftpd</string>
+  <string>com.example.macftpd</string>
   <key>ProgramArguments</key>
   <array>
     <string>/opt/macftpd/bin/macftpd</string>
@@ -23,7 +23,7 @@
   <key>EnvironmentVariables</key>
   <dict>
     <key>MACFTPD_STORAGE_ROOT</key>
-    <string>/srv/macftpd/ftpd</string>
+    <string>/srv/macftpd/files</string>
   </dict>
 </dict>
 </plist>
