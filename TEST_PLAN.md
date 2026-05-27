@@ -1,27 +1,36 @@
 # macftpd Feature Test Plan
 
-Use this checklist against a local or lab test instance. Replace all hostnames, paths, and credentials with your own non-production values.
+Use this checklist against the remote Mac long-term test instance.
 
 ## Endpoints
 
-- FTP control: `localhost:2121`
+- FTP control: `example-host.local:2121`
 - FTP passive data: `50000-50100`
-- HTTP health: `http://localhost:8080/healthz`
-- HTTP admin: `http://localhost:8080/admin`
-- Public files: `http://localhost:8080/public/<path>`
-- Example storage root: `/tmp/macftpd/ftpd`
+- HTTP health: `http://example-host.local:8080/healthz`
+- Cloudflare HTTP: `https://ftp.example.com`
+- HTTP admin: `http://example-host.local:8080/admin`
+- Public files: `http://example-host.local:8080/public/<path>`
+- Storage root on remote Mac: `/srv/macftpd/files`
 
 ## Operations And Monitoring
 
-- Run locally: `go run ./cmd/macftpd -config configs/macftpd.example.json`
-- Manual smoke test: `ADMIN_PASS="change-this-password" ./scripts/smoke-example.sh`
-- Inspect logs from your configured service manager or terminal session.
+- Attach to server screen: `ssh macftpd@example-host.local 'screen -r macftpd-server'`
+- Attach to monitor screen: `ssh macftpd@example-host.local 'screen -r macftpd-monitor'`
+- Detach from screen: `Ctrl-A`, then `D`
+- Server log: `/opt/macftpd/var/macftpd.screen.log`
+- Monitor log: `/opt/macftpd/var/monitor.log`
+- Cloudflare tunnel log: `/opt/macftpd/var/cloudflared.screen.log`
+- Manual smoke test: `ADMIN_PASS="$(cat var/admin-pass.txt)" ./scripts/smoke-remote.sh`
+- Restart long-term screens: `./scripts/start-remote-longterm.sh`
 
 ## FTP Protocol
 
 - Login succeeds with valid admin credentials.
 - Login fails with wrong password.
 - `SYST`, `FEAT`, `PWD`, `CWD`, `CDUP`, `NOOP`, and `QUIT` behave normally.
+- `FEAT` advertises `REST STREAM`, `MLSD`, `MLST`, and, when configured, `AUTH TLS`/`PBSZ`/`PROT`.
+- `AUTH TLS`, `PBSZ 0`, and `PROT P` allow protected login and data transfers.
+- `MLSD` and `MLST` return machine-readable facts.
 - ASCII and binary `TYPE` commands are accepted.
 - Passive mode works with `PASV`.
 - Extended passive mode works with `EPSV`.
@@ -79,24 +88,49 @@ Use this checklist against a local or lab test instance. Replace all hostnames, 
 
 ## Public HTTP Files
 
-- Place a file under the configured `public` directory.
+- Place a file under `/srv/macftpd/files/public`.
 - Fetch it from `/public/<file>`.
 - Confirm `Cache-Control` is present.
 - Confirm `Cache-Tag` is present when Cloudflare cache tag is configured.
+- Create a share link with `POST /api/shares`, open the returned `/share/<id>/<token>` URL, and download with `?download=1`.
+- Create an upload drop link with `POST /api/shares {"kind":"upload"}`, upload a file to `/drop/<id>/<token>`, and confirm it appears in the destination folder.
+- Delete a file and confirm it appears in `GET /api/retention?kind=trash`; restore it with `POST /api/retention/restore`.
+- Overwrite a file and confirm a version appears in `GET /api/retention?kind=versions`.
+- Confirm `/api/status` shows active FTP sessions during a held FTP control connection.
+- Confirm `/api/doctor` reports storage roots, share store, activity store, Cloudflare config, and Turnstile config.
 - Confirm missing files return `404`.
 - Confirm traversal attempts under `/public/` cannot escape the public folder.
 
 ## Cloudflare
 
-- Configure a test hostname such as `ftp.example.com` and an origin such as `macftpd-origin.example.com`.
-- Confirm `/healthz` returns `200` and `X-Macftpd-Cache: BYPASS`.
+- Confirm `https://ftp.example.com/healthz` returns `200` and `X-Macftpd-Cache: BYPASS`.
+- Confirm `https://ftp.example.com/admin/` works with admin Basic auth.
+- From `https://ftp.example.com/admin/`, create, edit, list, and delete a test user; saves must not fail with `cross-origin admin request denied`.
+- Confirm `https://ftp.example.com/public/` renders the sortable public directory listing.
+- Fetch the same `https://ftp.example.com/public/<file>` twice and confirm `X-Macftpd-Cache: HIT` on a repeated request.
+- Confirm public responses include CDN cache headers.
 - Confirm `/admin/`, `/api/*`, and `/healthz` include `Cache-Control: no-store` through the Worker.
-- Confirm a write with `Origin: https://evil.example` returns `403`.
-- Confirm `/public/<file>` can be cached and purged without exposing the API token.
+- Confirm a write with `Origin: https://evil.example` still returns `403`.
+- Confirm `macftpd-cloudflared` screen remains attached to the `macftpd-tunnel` tunnel.
+- Configure `cloudflare.enabled`, `zone_id`, and `api_token` for in-app purge once a zone cache-purge token is available.
+- `POST /api/cloudflare/purge` purges cache without exposing the token after that token is configured.
+- `POST /api/cloudflare/purge` with `paths` purges specific public-file URLs.
+- Run `scripts/cloudflare-hardening.sh` with a Cloudflare zone token to install/update the macftpd WAF ruleset.
+- Run `scripts/cloudflare-access-admin.sh` with `ALLOW_EMAILS` to install/update the Cloudflare Access app for `/admin*`.
 
-## Durability
+## HTTP FTP Pull
 
-- Restart the service and confirm config/users persist.
-- Re-run deploy and confirm existing config is preserved.
+- Use `/api/fxp` to pull a file from another FTP server into local storage.
+- Confirm pulled file appears in `GET /api/files`.
+- Confirm pulled file can be downloaded over FTP.
+- Confirm invalid remote credentials fail without creating a partial file.
+
+## macOS And Durability
+
+- Restart the screen server and confirm config/users persist.
+- Re-run deploy and confirm existing `/opt/macftpd/config.json` is preserved.
+- Confirm `/srv/macftpd/files` remains the storage root.
+- Reboot remote Mac and decide whether to use manual screen restart or launchd after Full Disk Access is granted.
 - Fill passive port range with multiple simultaneous downloads.
-- Leave monitoring running overnight and inspect failed health checks.
+- Leave monitor running overnight and inspect `status=fail` lines.
+- Run `ADMIN_PASS=... HOST=192.0.2.10 ./scripts/protocol-lab.sh` for the recursive FTP compatibility suite.

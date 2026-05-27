@@ -31,7 +31,7 @@ func TestFTPStoreRetrieveAndDelete(t *testing.T) {
 		t.Fatal(err)
 	}
 	activityLog := activity.New(100)
-	server, err := New(config.FTPConfig{Listen: "127.0.0.1:0", PassivePorts: "", AllowActive: true, Welcome: "test"}, store, root, activityLog)
+	server, err := New(config.FTPConfig{Listen: "127.0.0.1:0", PassivePorts: "", AllowActive: true, Welcome: "test"}, store, root, activityLog, nil)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -106,7 +106,7 @@ func TestFTPResumeStoreAndRetrieve(t *testing.T) {
 		t.Fatal(err)
 	}
 	activityLog := activity.New(100)
-	server, err := New(config.FTPConfig{Listen: "127.0.0.1:0", PassivePorts: "", AllowActive: true, Welcome: "test"}, store, root, activityLog)
+	server, err := New(config.FTPConfig{Listen: "127.0.0.1:0", PassivePorts: "", AllowActive: true, Welcome: "test"}, store, root, activityLog, nil)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -207,7 +207,7 @@ func TestFTPPublicDropboxMountsAndPublicDeleteProtection(t *testing.T) {
 	if err := os.WriteFile(dir+"/root/public/keep.txt", []byte("keep"), 0o640); err != nil {
 		t.Fatal(err)
 	}
-	server, err := New(config.FTPConfig{Listen: "127.0.0.1:0", PassivePorts: "", AllowActive: true, Welcome: "test"}, store, root, activity.New(100))
+	server, err := New(config.FTPConfig{Listen: "127.0.0.1:0", PassivePorts: "", AllowActive: true, Welcome: "test"}, store, root, activity.New(100), nil)
 	if err != nil {
 		t.Fatal(err)
 	}

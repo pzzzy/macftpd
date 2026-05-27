@@ -1,13 +1,17 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-REMOTE="${REMOTE:-deployer@example-host}"
-KEY="${KEY:-~/.ssh/id_ed25519}"
+REMOTE="${REMOTE:-macftpd@example-host.local}"
+KEY="${KEY:-}"
 REMOTE_DIR="${REMOTE_DIR:-/opt/macftpd}"
 SESSION="${SESSION:-macftpd-cloudflared}"
 TUNNEL_TOKEN="${TUNNEL_TOKEN:-}"
 TUNNEL_TOKEN_FILE="${TUNNEL_TOKEN_FILE:-}"
 CLOUDFLARED="${CLOUDFLARED:-/opt/homebrew/bin/cloudflared}"
+SSH_OPTS=()
+if [[ -n "${KEY}" ]]; then
+  SSH_OPTS=(-i "${KEY}")
+fi
 
 if [[ -z "${TUNNEL_TOKEN}" && -n "${TUNNEL_TOKEN_FILE}" ]]; then
   TUNNEL_TOKEN="$(cat "${TUNNEL_TOKEN_FILE}")"
@@ -17,9 +21,9 @@ if [[ -z "${TUNNEL_TOKEN}" ]]; then
   exit 2
 fi
 
-scp -i "${KEY}" "${CLOUDFLARED}" "${REMOTE}:${REMOTE_DIR}/bin/cloudflared"
+scp "${SSH_OPTS[@]}" "${CLOUDFLARED}" "${REMOTE}:${REMOTE_DIR}/bin/cloudflared"
 
-ssh -i "${KEY}" "${REMOTE}" "REMOTE_DIR='${REMOTE_DIR}' SESSION='${SESSION}' TUNNEL_TOKEN='${TUNNEL_TOKEN}' bash -s" <<'SH'
+ssh "${SSH_OPTS[@]}" "${REMOTE}" "REMOTE_DIR='${REMOTE_DIR}' SESSION='${SESSION}' TUNNEL_TOKEN='${TUNNEL_TOKEN}' bash -s" <<'SH'
 set -euo pipefail
 mkdir -p "${REMOTE_DIR}/var"
 chmod 755 "${REMOTE_DIR}/bin/cloudflared"

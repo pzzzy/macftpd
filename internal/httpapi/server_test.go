@@ -14,6 +14,7 @@ import (
 	"macftpd/internal/auth"
 	"macftpd/internal/cloudflare"
 	"macftpd/internal/config"
+	"macftpd/internal/share"
 	"macftpd/internal/storage"
 )
 
@@ -419,8 +420,12 @@ func testServer(t *testing.T) *Server {
 	if err := store.BootstrapAdmin("admin", "secret"); err != nil {
 		t.Fatal(err)
 	}
+	links, err := share.Open(dir + "/shares.json")
+	if err != nil {
+		t.Fatal(err)
+	}
 	return New(config.HTTPConfig{
 		PublicCacheControl: "public, max-age=300",
 		SessionKey:         "test",
-	}, store, root, cloudflare.New(config.CloudflareConfig{CacheTag: "test-tag"}), activity.New(200))
+	}, store, root, cloudflare.New(config.CloudflareConfig{CacheTag: "test-tag"}), activity.New(200), links, nil)
 }

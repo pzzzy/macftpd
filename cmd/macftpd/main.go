@@ -16,6 +16,8 @@ import (
 	"macftpd/internal/config"
 	"macftpd/internal/ftpserver"
 	"macftpd/internal/httpapi"
+	"macftpd/internal/share"
+	"macftpd/internal/status"
 	"macftpd/internal/storage"
 )
 
@@ -52,11 +54,16 @@ func main() {
 	if err != nil {
 		log.Fatalf("open activity log: %v", err)
 	}
-	ftp, err := ftpserver.New(cfg.FTP, store, root, activityLog)
+	linkStore, err := share.Open(filepath.Join(filepath.Dir(cfg.Auth.UsersPath), "shares.json"))
+	if err != nil {
+		log.Fatalf("open share store: %v", err)
+	}
+	tracker := status.New()
+	ftp, err := ftpserver.New(cfg.FTP, store, root, activityLog, tracker)
 	if err != nil {
 		log.Fatalf("create ftp server: %v", err)
 	}
-	http := httpapi.New(cfg.HTTP, store, root, cloudflare.New(cfg.Cloudflare), activityLog)
+	http := httpapi.New(cfg.HTTP, store, root, cloudflare.New(cfg.Cloudflare), activityLog, linkStore, tracker)
 
 	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
 	defer stop()

@@ -1,12 +1,14 @@
 package storage
 
 import (
+	"encoding/json"
 	"errors"
 	"fmt"
 	"io"
 	"io/fs"
 	"os"
 	"path/filepath"
+	"sort"
 	"strings"
 	"time"
 
@@ -40,6 +42,15 @@ type CopyResult struct {
 	Files    int    `json:"files"`
 	Bytes    int64  `json:"bytes"`
 	Strategy string `json:"strategy"`
+}
+
+type RetainedEntry struct {
+	ID           string    `json:"id"`
+	OriginalPath string    `json:"original_path"`
+	RetainedPath string    `json:"retained_path"`
+	Size         int64     `json:"size"`
+	IsDir        bool      `json:"is_dir"`
+	ModTime      time.Time `json:"mod_time"`
 }
 
 func New(base, publicDir, dropboxDir string, ignore []string) (*Root, error) {
@@ -348,6 +359,98 @@ func (r *Root) RemoveAll(realPath string) error {
 	return root.RemoveAll(rel)
 }
 
+func (r *Root) Trash(realPath, virtual, actor string) (RetainedEntry, error) {
+	return r.retain(realPath, virtual, actor, "._macftpd_trash", true)
+}
+
+func (r *Root) Version(realPath, virtual, actor string) (RetainedEntry, error) {
+	return r.retain(realPath, virtual, actor, "._macftpd_versions", false)
+}
+
+func (r *Root) ListRetained(kind string) ([]RetainedEntry, error) {
+	rootName := retainedRoot(kind)
+	realRoot := filepath.Join(r.Base, rootName)
+	if err := os.MkdirAll(realRoot, 0o750); err != nil {
+		return nil, err
+	}
+	root, err := os.OpenRoot(realRoot)
+	if err != nil {
+		return nil, err
+	}
+	defer root.Close()
+	var entries []RetainedEntry
+	err = filepath.WalkDir(realRoot, func(p string, d fs.DirEntry, err error) error {
+		if err != nil || d.IsDir() {
+			return nil
+		}
+		if filepath.Base(p) != ".macftpd-retain.json" {
+			return nil
+		}
+		rel, err := filepath.Rel(realRoot, p)
+		if err != nil || rel == "." || strings.HasPrefix(rel, ".."+string(os.PathSeparator)) || filepath.IsAbs(rel) {
+			return nil
+		}
+		file, err := root.Open(rel)
+		if err != nil {
+			return nil
+		}
+		defer file.Close()
+		raw, err := io.ReadAll(file)
+		if err != nil {
+			return nil
+		}
+		var entry RetainedEntry
+		if err := json.Unmarshal(raw, &entry); err == nil && entry.ID != "" {
+			entries = append(entries, entry)
+		}
+		return nil
+	})
+	sort.Slice(entries, func(i, j int) bool { return entries[i].ModTime.After(entries[j].ModTime) })
+	return entries, err
+}
+
+func (r *Root) Restore(kind, id, destVirtual string, overwrite bool) (string, error) {
+	rootName := retainedRoot(kind)
+	if id == "" || strings.Contains(id, string(os.PathSeparator)) || strings.Contains(id, "/") {
+		return "", ErrOutsideRoot
+	}
+	retainedDir := filepath.Join(r.Base, rootName, id)
+	raw, err := os.ReadFile(filepath.Join(retainedDir, ".macftpd-retain.json")) // #nosec G304 -- id is constrained above and root is fixed.
+	if err != nil {
+		return "", err
+	}
+	var entry RetainedEntry
+	if err := json.Unmarshal(raw, &entry); err != nil {
+		return "", err
+	}
+	if destVirtual == "" {
+		destVirtual = entry.OriginalPath
+	}
+	destVirtual = cleanVirtual(destVirtual)
+	destReal, err := r.realFromVirtual(destVirtual)
+	if err != nil {
+		return "", err
+	}
+	if !overwrite {
+		if _, err := r.Stat(destReal); err == nil {
+			return "", errors.New("destination exists")
+		}
+	}
+	if err := r.MkdirAllParent(destReal, 0o750); err != nil {
+		return "", err
+	}
+	payload := filepath.Join(retainedDir, "payload")
+	if overwrite {
+		_ = r.RemoveAll(destReal)
+	}
+	if err := os.Rename(payload, destReal); err != nil {
+		return "", err
+	}
+	_ = os.Remove(filepath.Join(retainedDir, ".macftpd-retain.json"))
+	_ = os.Remove(retainedDir)
+	return destVirtual, nil
+}
+
 func (r *Root) Rename(oldPath, newPath string) error {
 	root, err := os.OpenRoot(r.Base)
 	if err != nil {
@@ -363,6 +466,47 @@ func (r *Root) Rename(oldPath, newPath string) error {
 		return err
 	}
 	return root.Rename(oldRel, newRel)
+}
+
+func (r *Root) retain(realPath, virtual, actor, rootName string, move bool) (RetainedEntry, error) {
+	info, err := r.Stat(realPath)
+	if err != nil {
+		return RetainedEntry{}, err
+	}
+	if virtual == "" {
+		virtual = "/" + strings.TrimPrefix(filepath.ToSlash(mustRel(r.Base, realPath)), "./")
+	}
+	id := time.Now().UTC().Format("20060102T150405.000000000Z") + "-" + safeName(actor)
+	retainedDir := filepath.Join(r.Base, rootName, id)
+	payload := filepath.Join(retainedDir, "payload")
+	if err := os.MkdirAll(retainedDir, 0o750); err != nil {
+		return RetainedEntry{}, err
+	}
+	entry := RetainedEntry{
+		ID:           id,
+		OriginalPath: cleanVirtual(virtual),
+		RetainedPath: "/" + rootName + "/" + id,
+		Size:         info.Size(),
+		IsDir:        info.IsDir(),
+		ModTime:      time.Now().UTC(),
+	}
+	raw, err := json.MarshalIndent(entry, "", "  ")
+	if err != nil {
+		return RetainedEntry{}, err
+	}
+	if move {
+		if err := os.Rename(realPath, payload); err != nil {
+			return RetainedEntry{}, err
+		}
+	} else {
+		if _, err := r.Copy(realPath, payload, CopyOptions{Deduplicate: true, Overwrite: true}); err != nil {
+			return RetainedEntry{}, err
+		}
+	}
+	if err := os.WriteFile(filepath.Join(retainedDir, ".macftpd-retain.json"), raw, 0o600); err != nil {
+		return RetainedEntry{}, err
+	}
+	return entry, nil
 }
 
 func (r *Root) Copy(srcPath, dstPath string, opts CopyOptions) (CopyResult, error) {
@@ -511,4 +655,36 @@ func WriteFileAtomic(path string, mode fs.FileMode, data []byte) error {
 		return err
 	}
 	return os.Rename(tmp, path)
+}
+
+func retainedRoot(kind string) string {
+	if kind == "versions" || kind == "version" {
+		return "._macftpd_versions"
+	}
+	return "._macftpd_trash"
+}
+
+func safeName(name string) string {
+	name = strings.TrimSpace(strings.ToLower(name))
+	if name == "" {
+		return "system"
+	}
+	var b strings.Builder
+	for _, r := range name {
+		if r >= 'a' && r <= 'z' || r >= '0' && r <= '9' || r == '-' || r == '_' || r == '.' {
+			b.WriteRune(r)
+		}
+	}
+	if b.Len() == 0 {
+		return "system"
+	}
+	return b.String()
+}
+
+func mustRel(base, realPath string) string {
+	rel, err := filepath.Rel(base, realPath)
+	if err != nil {
+		return filepath.Base(realPath)
+	}
+	return rel
 }

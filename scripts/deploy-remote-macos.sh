@@ -1,10 +1,10 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-REMOTE="${REMOTE:-deployer@example-host}"
-KEY="${KEY:-~/.ssh/id_ed25519}"
+REMOTE="${REMOTE:-macftpd@example-host.local}"
+KEY="${KEY:-}"
 REMOTE_DIR="${REMOTE_DIR:-/opt/macftpd}"
-STORAGE_ROOT="${STORAGE_ROOT:-/srv/macftpd/ftpd}"
+STORAGE_ROOT="${STORAGE_ROOT:-/srv/macftpd/files}"
 START_MODE="${START_MODE:-manual}"
 FTP_LISTEN="${FTP_LISTEN:-0.0.0.0:2121}"
 HTTP_LISTEN="${HTTP_LISTEN:-0.0.0.0:8080}"
@@ -15,6 +15,10 @@ FTP_NAT_GATEWAY="${FTP_NAT_GATEWAY:-}"
 ADMIN_USER="${ADMIN_USER:-admin}"
 ADMIN_PASS="${ADMIN_PASS:-}"
 SESSION_KEY="${SESSION_KEY:-}"
+SSH_OPTS=()
+if [[ -n "${KEY}" ]]; then
+  SSH_OPTS=(-i "${KEY}")
+fi
 
 if [[ -z "${ADMIN_PASS}" ]]; then
   ADMIN_PASS="$(openssl rand -base64 24 | tr '+/' '-_')"
@@ -39,10 +43,13 @@ cfg = {
     "auto_map": auto_map,
     "nat_gateway": "${FTP_NAT_GATEWAY}",
     "mapping_lifetime": "1h",
+    "tls_cert_file": "",
+    "tls_key_file": "",
+    "require_tls": False,
     "allow_active": True,
     "allow_fxp": False,
     "idle_timeout": "10m",
-    "welcome": "macftpd on example host ready"
+    "welcome": "macftpd ready"
   },
   "http": {
     "listen": "${HTTP_LISTEN}",
@@ -56,7 +63,7 @@ cfg = {
     "root": "${STORAGE_ROOT}",
     "public_dir": "public",
     "dropbox_dir": "dropboxes",
-    "ignore": [".DS_Store", "._*", ".AppleDouble", ".Spotlight-V100", ".Trashes", ".fseventsd", ".TemporaryItems", ".apdisk", ".git", ".svn", ".hg", ".env", ".ssh"]
+    "ignore": [".DS_Store", "._*", ".AppleDouble", ".Spotlight-V100", ".Trashes", ".fseventsd", ".TemporaryItems", ".apdisk", ".git", ".svn", ".hg", ".env", ".ssh", "._macftpd_trash", "._macftpd_versions"]
   },
   "auth": {
     "users_path": "${REMOTE_DIR}/var/users.json",
@@ -75,13 +82,13 @@ with open(sys.argv[1], "w") as f:
     json.dump(cfg, f, indent=2)
 PY
 
-ssh -i "${KEY}" "${REMOTE}" "mkdir -p '${REMOTE_DIR}/bin' '${REMOTE_DIR}/var' '${STORAGE_ROOT}/public' '${STORAGE_ROOT}/dropboxes'"
-scp -i "${KEY}" dist/macftpd "${REMOTE}:${REMOTE_DIR}/bin/macftpd.new"
-scp -i "${KEY}" "${tmp_config}" "${REMOTE}:${REMOTE_DIR}/config.json.new"
-scp -i "${KEY}" launchd/com.luke.macftpd.plist "${REMOTE}:${REMOTE_DIR}/com.luke.macftpd.plist.new"
+ssh "${SSH_OPTS[@]}" "${REMOTE}" "mkdir -p '${REMOTE_DIR}/bin' '${REMOTE_DIR}/var' '${STORAGE_ROOT}/public' '${STORAGE_ROOT}/dropboxes'"
+scp "${SSH_OPTS[@]}" dist/macftpd "${REMOTE}:${REMOTE_DIR}/bin/macftpd.new"
+scp "${SSH_OPTS[@]}" "${tmp_config}" "${REMOTE}:${REMOTE_DIR}/config.json.new"
+scp "${SSH_OPTS[@]}" launchd/com.example.macftpd.plist "${REMOTE}:${REMOTE_DIR}/com.example.macftpd.plist.new"
 rm -f "${tmp_config}"
 
-ssh -i "${KEY}" "${REMOTE}" "REMOTE_DIR='${REMOTE_DIR}' START_MODE='${START_MODE}' bash -s" <<'SH'
+ssh "${SSH_OPTS[@]}" "${REMOTE}" "REMOTE_DIR='${REMOTE_DIR}' START_MODE='${START_MODE}' bash -s" <<'SH'
 set -euo pipefail
 REMOTE_DIR="${REMOTE_DIR:-/opt/macftpd}"
 chmod 755 "${REMOTE_DIR}/bin/macftpd.new"
@@ -101,7 +108,8 @@ with open(new_path) as f:
     new = json.load(f)
 for section, keys in {
     "auth": ["bootstrap_admin_pass"],
-    "http": ["session_key"],
+    "http": ["session_key", "turnstile_site_key", "turnstile_secret"],
+    "ftp": ["tls_cert_file", "tls_key_file", "require_tls"],
     "cloudflare": ["zone_id", "api_token", "enabled"],
 }.items():
     if section in old and section in new:
@@ -116,15 +124,15 @@ PY
   mv "${REMOTE_DIR}/config.json.merged" "${REMOTE_DIR}/config.json"
 fi
 chmod 600 "${REMOTE_DIR}/config.json" "${REMOTE_DIR}/config.json.last_deployed" 2>/dev/null || true
-mv "${REMOTE_DIR}/com.luke.macftpd.plist.new" "${REMOTE_DIR}/com.luke.macftpd.plist"
-cp "${REMOTE_DIR}/com.luke.macftpd.plist" "${HOME}/Library/LaunchAgents/com.luke.macftpd.plist"
-launchctl bootout "gui/$(id -u)/com.luke.macftpd" 2>/dev/null || true
+mv "${REMOTE_DIR}/com.example.macftpd.plist.new" "${REMOTE_DIR}/com.example.macftpd.plist"
+cp "${REMOTE_DIR}/com.example.macftpd.plist" "${HOME}/Library/LaunchAgents/com.example.macftpd.plist"
+launchctl bootout "gui/$(id -u)/com.example.macftpd" 2>/dev/null || true
 pkill -x macftpd 2>/dev/null || true
 if [[ "${START_MODE}" == "launchd" ]]; then
-  launchctl bootstrap "gui/$(id -u)" "${HOME}/Library/LaunchAgents/com.luke.macftpd.plist"
-  launchctl kickstart -k "gui/$(id -u)/com.luke.macftpd"
+  launchctl bootstrap "gui/$(id -u)" "${HOME}/Library/LaunchAgents/com.example.macftpd.plist"
+  launchctl kickstart -k "gui/$(id -u)/com.example.macftpd"
   sleep 1
-  launchctl print "gui/$(id -u)/com.luke.macftpd" | sed -n '1,80p'
+  launchctl print "gui/$(id -u)/com.example.macftpd" | sed -n '1,80p'
 else
   nohup "${REMOTE_DIR}/bin/macftpd" -config "${REMOTE_DIR}/config.json" >"${REMOTE_DIR}/var/macftpd.manual.log" 2>"${REMOTE_DIR}/var/macftpd.manual.err.log" </dev/null &
   sleep 1
@@ -134,5 +142,5 @@ fi
 SH
 
 echo "Deployment complete."
-echo "HTTP health: http://example-host.local:8080/healthz"
-echo "FTP: example-host.local:2121 user=${ADMIN_USER}"
+echo "HTTP health: http://${REMOTE#*@}:8080/healthz"
+echo "FTP: ${REMOTE#*@}:2121 user=${ADMIN_USER}"

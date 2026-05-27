@@ -30,6 +30,8 @@ import (
 	"macftpd/internal/cloudflare"
 	"macftpd/internal/config"
 	"macftpd/internal/ratelimit"
+	"macftpd/internal/share"
+	"macftpd/internal/status"
 	"macftpd/internal/storage"
 )
 
@@ -42,6 +44,8 @@ type Server struct {
 	sessionKey []byte
 	limiter    *ratelimit.Limiter
 	activity   *activity.Store
+	links      *share.Store
+	tracker    *status.Tracker
 }
 
 type principal struct {
@@ -75,14 +79,17 @@ func (r userRequest) user() auth.User {
 	}
 }
 
-func New(cfg config.HTTPConfig, store *auth.Store, root *storage.Root, cf *cloudflare.Client, activityLog *activity.Store) *Server {
-	return &Server{cfg: cfg, store: store, root: root, cloudflare: cf, sessionKey: []byte(cfg.SessionKey), limiter: ratelimit.New(5, 10*time.Minute, 5*time.Minute), activity: activityLog}
+func New(cfg config.HTTPConfig, store *auth.Store, root *storage.Root, cf *cloudflare.Client, activityLog *activity.Store, links *share.Store, tracker *status.Tracker) *Server {
+	return &Server{cfg: cfg, store: store, root: root, cloudflare: cf, sessionKey: []byte(cfg.SessionKey), limiter: ratelimit.New(5, 10*time.Minute, 5*time.Minute), activity: activityLog, links: links, tracker: tracker}
 }
 
 func (s *Server) ListenAndServe(ctx context.Context) error {
 	mux := http.NewServeMux()
 	mux.HandleFunc("/healthz", s.health)
 	mux.HandleFunc("/public/", s.public)
+	mux.HandleFunc("/public-info/", s.publicInfo)
+	mux.HandleFunc("/share/", s.shareLink)
+	mux.HandleFunc("/drop/", s.dropLink)
 	mux.HandleFunc("/admin", s.requireAdmin(s.admin))
 	mux.HandleFunc("/admin/", s.requireAdmin(s.admin))
 	mux.HandleFunc("/api/login", s.login)
@@ -97,6 +104,12 @@ func (s *Server) ListenAndServe(ctx context.Context) error {
 	mux.HandleFunc("/api/upload", s.requireAdmin(s.upload))
 	mux.HandleFunc("/api/fxp", s.requireAdmin(s.fxp))
 	mux.HandleFunc("/api/activity", s.requireAdmin(s.activityFeed))
+	mux.HandleFunc("/api/status", s.requireAdmin(s.statusAPI))
+	mux.HandleFunc("/api/doctor", s.requireAdmin(s.doctorAPI))
+	mux.HandleFunc("/api/shares", s.requireAdmin(s.sharesAPI))
+	mux.HandleFunc("/api/shares/", s.requireAdmin(s.shareAPI))
+	mux.HandleFunc("/api/retention", s.requireAdmin(s.retentionAPI))
+	mux.HandleFunc("/api/retention/restore", s.requireAdmin(s.restoreAPI))
 	mux.HandleFunc("/api/cloudflare/purge", s.requireAdmin(s.purgeCloudflare))
 	s.server = &http.Server{
 		Addr:         s.cfg.Listen,
@@ -153,6 +166,153 @@ func (s *Server) public(w http.ResponseWriter, r *http.Request) {
 	s.serveStorageFile(w, r, realPath, info.Name())
 }
 
+func (s *Server) publicInfo(w http.ResponseWriter, r *http.Request) {
+	rel := strings.TrimPrefix(r.URL.Path, "/public-info/")
+	realPath, virtual, err := s.publicPath("/public/" + rel)
+	if err != nil {
+		http.NotFound(w, r)
+		return
+	}
+	info, err := s.root.Stat(realPath)
+	if err != nil {
+		http.NotFound(w, r)
+		return
+	}
+	href := "/public/" + strings.TrimPrefix(strings.TrimPrefix(virtual, "/"+s.root.PublicDir), "/")
+	w.Header().Set("Content-Type", "text/html; charset=utf-8")
+	w.Header().Set("Cache-Control", "public, max-age=60, stale-while-revalidate=30")
+	_ = fileInfoTemplate.Execute(w, map[string]any{
+		"Title":   info.Name(),
+		"Name":    info.Name(),
+		"Path":    virtual,
+		"Href":    href,
+		"Size":    humanSize(info.Size(), info.IsDir()),
+		"Type":    map[bool]string{true: "Folder", false: "File"}[info.IsDir()],
+		"ModTime": info.ModTime().Format(time.RFC1123),
+	})
+}
+
+func (s *Server) shareLink(w http.ResponseWriter, r *http.Request) {
+	id, token, ok := linkParts(r.URL.Path, "/share/")
+	if !ok {
+		http.NotFound(w, r)
+		return
+	}
+	meta, err := s.links.Public(id)
+	if err != nil || meta.Kind != share.KindDownload {
+		http.NotFound(w, r)
+		return
+	}
+	needsPassword := meta.HasPassword
+	password := ""
+	if r.Method == http.MethodPost {
+		password = r.FormValue("password")
+	}
+	meta, err = s.links.Verify(id, token, password)
+	if err != nil {
+		if needsPassword || errors.Is(err, share.ErrDenied) {
+			w.Header().Set("Content-Type", "text/html; charset=utf-8")
+			_ = passwordTemplate.Execute(w, map[string]any{"Title": "Protected share"})
+			return
+		}
+		http.Error(w, "share unavailable", http.StatusGone)
+		return
+	}
+	realPath, clean, err := s.root.ResolveAdmin(meta.Path)
+	if err != nil {
+		http.NotFound(w, r)
+		return
+	}
+	info, err := s.root.Stat(realPath)
+	if err != nil {
+		http.NotFound(w, r)
+		return
+	}
+	if r.URL.Query().Get("download") == "1" && !info.IsDir() {
+		_ = s.links.RecordDownload(id)
+		w.Header().Set("Content-Disposition", fmt.Sprintf("attachment; filename=%q", info.Name()))
+		s.serveStorageFile(w, r, realPath, info.Name())
+		return
+	}
+	w.Header().Set("Content-Type", "text/html; charset=utf-8")
+	_ = fileInfoTemplate.Execute(w, map[string]any{
+		"Title":   "Shared " + info.Name(),
+		"Name":    info.Name(),
+		"Path":    clean,
+		"Href":    r.URL.Path + "?download=1",
+		"Size":    humanSize(info.Size(), info.IsDir()),
+		"Type":    map[bool]string{true: "Folder", false: "File"}[info.IsDir()],
+		"ModTime": info.ModTime().Format(time.RFC1123),
+	})
+}
+
+func (s *Server) dropLink(w http.ResponseWriter, r *http.Request) {
+	id, token, ok := linkParts(r.URL.Path, "/drop/")
+	if !ok {
+		http.NotFound(w, r)
+		return
+	}
+	meta, err := s.links.Verify(id, token, r.FormValue("password"))
+	if err != nil || meta.Kind != share.KindUpload {
+		http.Error(w, "drop link unavailable", http.StatusGone)
+		return
+	}
+	if r.Method == http.MethodGet {
+		w.Header().Set("Content-Type", "text/html; charset=utf-8")
+		_ = dropTemplate.Execute(w, meta)
+		return
+	}
+	if r.Method != http.MethodPost {
+		http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
+		return
+	}
+	r.Body = http.MaxBytesReader(w, r.Body, 20<<30)
+	// #nosec G120 -- MaxBytesReader caps the request; multipart spools file parts above maxMemory.
+	if err := r.ParseMultipartForm(32 << 20); err != nil {
+		http.Error(w, "bad upload", http.StatusBadRequest)
+		return
+	}
+	file, header, err := r.FormFile("file")
+	if err != nil {
+		http.Error(w, "file is required", http.StatusBadRequest)
+		return
+	}
+	defer file.Close()
+	name := filepath.Base(header.Filename)
+	destVirtual := path.Join(meta.Path, name)
+	dest, _, err := s.root.ResolveAdmin(destVirtual)
+	if err != nil {
+		http.Error(w, "bad destination", http.StatusBadRequest)
+		return
+	}
+	if !meta.AllowOverwrite {
+		if _, err := s.root.Stat(dest); err == nil {
+			http.Error(w, "destination exists", http.StatusConflict)
+			return
+		}
+	} else if info, err := s.root.Stat(dest); err == nil && !info.IsDir() {
+		_, _ = s.root.Version(dest, destVirtual, "drop-link")
+	}
+	if err := s.root.MkdirAllParent(dest, 0o750); err != nil {
+		http.Error(w, err.Error(), http.StatusInternalServerError)
+		return
+	}
+	out, err := s.root.OpenFile(dest, os.O_CREATE|os.O_TRUNC|os.O_WRONLY, 0o640)
+	if err != nil {
+		http.Error(w, err.Error(), http.StatusInternalServerError)
+		return
+	}
+	n, err := io.Copy(out, file)
+	_ = out.Close()
+	if err != nil {
+		http.Error(w, err.Error(), http.StatusInternalServerError)
+		return
+	}
+	s.logActivity(activity.Event{Type: "public_drop", Protocol: "http", Actor: "drop-link", Remote: remoteAddr(r), Action: "upload", Path: destVirtual, Bytes: n, Detail: "public drop link upload"})
+	w.Header().Set("Content-Type", "text/html; charset=utf-8")
+	_, _ = w.Write([]byte("Upload complete"))
+}
+
 func (s *Server) publicPath(urlPath string) (string, string, error) {
 	rel := strings.TrimPrefix(urlPath, "/public/")
 	virtual := path.Clean("/" + s.root.PublicDir + "/" + rel)
@@ -200,9 +360,11 @@ func (s *Server) publicDirectory(w http.ResponseWriter, r *http.Request, realPat
 		if entry.IsDir {
 			href += "/"
 		}
+		infoHref := path.Join("/public-info", strings.TrimPrefix(entry.Path, publicRoot))
 		rows = append(rows, publicEntry{
 			Name:     entry.Name,
 			Href:     href,
+			InfoHref: infoHref,
 			Size:     entry.Size,
 			SizeText: humanSize(entry.Size, entry.IsDir),
 			IsDir:    entry.IsDir,
@@ -244,11 +406,17 @@ func (s *Server) login(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	var req struct {
-		Username string `json:"username"`
-		Password string `json:"password"`
+		Username       string `json:"username"`
+		Password       string `json:"password"`
+		TurnstileToken string `json:"turnstile_token"`
 	}
 	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
 		writeJSON(w, http.StatusBadRequest, errorBody("bad json"))
+		return
+	}
+	if err := s.verifyTurnstile(r, req.TurnstileToken); err != nil {
+		s.logActivity(activity.Event{Type: "http_login", Protocol: "http", Actor: auth.NormalizeName(req.Username), Remote: remoteAddr(r), Action: "login", Outcome: "denied", Detail: err.Error()})
+		writeJSON(w, http.StatusForbidden, errorBody("turnstile verification failed"))
 		return
 	}
 	limitKey := loginLimitKey(r, req.Username)
@@ -377,12 +545,12 @@ func (s *Server) files(w http.ResponseWriter, r *http.Request, p principal) {
 			writeJSON(w, http.StatusBadRequest, errorBody("refusing to delete storage root"))
 			return
 		}
-		if err := s.root.RemoveAll(realPath); err != nil {
+		if _, err := s.root.Trash(realPath, clean, p.User.Username); err != nil {
 			s.logActivity(activity.Event{Type: "admin_file", Protocol: "http", Actor: p.User.Username, Remote: remoteAddr(r), Action: "delete", Outcome: "failed", Path: clean, Detail: err.Error()})
 			writeJSON(w, http.StatusInternalServerError, errorBody(err.Error()))
 			return
 		}
-		s.logActivity(activity.Event{Type: "admin_file", Protocol: "http", Actor: p.User.Username, Remote: remoteAddr(r), Action: "delete", Path: clean, Detail: "admin deleted file or folder"})
+		s.logActivity(activity.Event{Type: "admin_file", Protocol: "http", Actor: p.User.Username, Remote: remoteAddr(r), Action: "delete", Path: clean, Detail: "admin moved file or folder to trash"})
 		writeJSON(w, http.StatusOK, map[string]bool{"ok": true})
 		return
 	case http.MethodPatch:
@@ -405,6 +573,9 @@ func (s *Server) files(w http.ResponseWriter, r *http.Request, p principal) {
 		if err := s.root.MkdirAllParent(destReal, 0o750); err != nil {
 			writeJSON(w, http.StatusInternalServerError, errorBody(err.Error()))
 			return
+		}
+		if info, err := s.root.Stat(destReal); err == nil && !info.IsDir() {
+			_, _ = s.root.Version(destReal, destClean, p.User.Username)
 		}
 		if err := s.root.Rename(realPath, destReal); err != nil {
 			s.logActivity(activity.Event{Type: "admin_file", Protocol: "http", Actor: p.User.Username, Remote: remoteAddr(r), Action: "move", Outcome: "failed", Path: clean, DestPath: destClean, Detail: err.Error()})
@@ -523,6 +694,11 @@ func (s *Server) fileAction(w http.ResponseWriter, r *http.Request, p principal)
 				writeJSON(w, http.StatusInternalServerError, errorBody(err.Error()))
 				return
 			}
+			if req.Overwrite {
+				if info, err := s.root.Stat(targetReal); err == nil && !info.IsDir() {
+					_, _ = s.root.Version(targetReal, targetClean, p.User.Username)
+				}
+			}
 			if err := s.root.Rename(srcReal, targetReal); err != nil {
 				s.logActivity(activity.Event{Type: "admin_file", Protocol: "http", Actor: p.User.Username, Remote: remoteAddr(r), Action: "move", Outcome: "failed", Path: srcClean, DestPath: targetClean, Detail: err.Error()})
 				writeJSON(w, http.StatusInternalServerError, errorBody(err.Error()))
@@ -531,6 +707,11 @@ func (s *Server) fileAction(w http.ResponseWriter, r *http.Request, p principal)
 			items = append(items, resultItem{Path: srcClean, DestPath: targetClean, Operation: "move"})
 			s.logActivity(activity.Event{Type: "admin_file", Protocol: "http", Actor: p.User.Username, Remote: remoteAddr(r), Action: "move", Path: srcClean, DestPath: targetClean, Detail: "admin moved file or folder"})
 			continue
+		}
+		if req.Overwrite {
+			if info, err := s.root.Stat(targetReal); err == nil && !info.IsDir() {
+				_, _ = s.root.Version(targetReal, targetClean, p.User.Username)
+			}
 		}
 		result, err := s.root.Copy(srcReal, targetReal, storage.CopyOptions{Deduplicate: req.Deduplicate, Overwrite: req.Overwrite})
 		if err != nil {
@@ -637,6 +818,9 @@ func (s *Server) upload(w http.ResponseWriter, r *http.Request, p principal) {
 		writeJSON(w, http.StatusBadRequest, errorBody("bad destination"))
 		return
 	}
+	if info, err := s.root.Stat(dest); err == nil && !info.IsDir() {
+		_, _ = s.root.Version(dest, destVirtual, p.User.Username)
+	}
 	out, err := s.root.OpenFile(dest, os.O_CREATE|os.O_TRUNC|os.O_WRONLY, 0o640)
 	if err != nil {
 		writeJSON(w, http.StatusInternalServerError, errorBody(err.Error()))
@@ -719,7 +903,22 @@ func (s *Server) purgeCloudflare(w http.ResponseWriter, r *http.Request, _ princ
 		writeJSON(w, http.StatusMethodNotAllowed, errorBody("method not allowed"))
 		return
 	}
-	if err := s.cloudflare.PurgeEverything(r.Context()); err != nil {
+	var req struct {
+		Files []string `json:"files"`
+		Paths []string `json:"paths"`
+	}
+	_ = json.NewDecoder(r.Body).Decode(&req)
+	var err error
+	if len(req.Files) > 0 || len(req.Paths) > 0 {
+		files := append([]string{}, req.Files...)
+		for _, p := range req.Paths {
+			files = append(files, absoluteURL(r, publicURLForVirtual(s.root, p)))
+		}
+		err = s.cloudflare.PurgeFiles(r.Context(), files)
+	} else {
+		err = s.cloudflare.PurgeEverything(r.Context())
+	}
+	if err != nil {
 		if errors.Is(err, cloudflare.ErrNotConfigured) {
 			writeJSON(w, http.StatusBadRequest, errorBody(err.Error()))
 			return
@@ -728,6 +927,13 @@ func (s *Server) purgeCloudflare(w http.ResponseWriter, r *http.Request, _ princ
 		return
 	}
 	writeJSON(w, http.StatusOK, map[string]bool{"ok": true})
+}
+
+func (s *Server) purgePublicPath(ctx context.Context, r *http.Request, virtual string) {
+	if !strings.HasPrefix(path.Clean(virtual), "/"+s.root.PublicDir) {
+		return
+	}
+	_ = s.cloudflare.PurgeFiles(ctx, []string{absoluteURL(r, publicURLForVirtual(s.root, virtual))})
 }
 
 func (s *Server) activityFeed(w http.ResponseWriter, r *http.Request, _ principal) {
@@ -739,6 +945,164 @@ func (s *Server) activityFeed(w http.ResponseWriter, r *http.Request, _ principa
 	after, _ := strconv.ParseInt(r.URL.Query().Get("after"), 10, 64)
 	events := s.activity.Recent(limit, after)
 	writeJSON(w, http.StatusOK, map[string]any{"events": events})
+}
+
+func (s *Server) statusAPI(w http.ResponseWriter, r *http.Request, _ principal) {
+	if r.Method != http.MethodGet {
+		writeJSON(w, http.StatusMethodNotAllowed, errorBody("method not allowed"))
+		return
+	}
+	sessions := []status.Session{}
+	if s.tracker != nil {
+		sessions = s.tracker.Snapshot()
+	}
+	writeJSON(w, http.StatusOK, map[string]any{"sessions": sessions, "time": time.Now().UTC()})
+}
+
+func (s *Server) doctorAPI(w http.ResponseWriter, r *http.Request, _ principal) {
+	if r.Method != http.MethodGet {
+		writeJSON(w, http.StatusMethodNotAllowed, errorBody("method not allowed"))
+		return
+	}
+	checks := []map[string]any{}
+	add := func(name string, ok bool, detail string) {
+		checks = append(checks, map[string]any{"name": name, "ok": ok, "detail": detail})
+	}
+	if info, err := os.Stat(s.root.Base); err == nil && info.IsDir() {
+		add("storage root", true, s.root.Base)
+	} else {
+		add("storage root", false, fmt.Sprint(err))
+	}
+	for _, dir := range []string{s.root.PublicDir, s.root.DropboxDir, "._macftpd_trash", "._macftpd_versions"} {
+		real := filepath.Join(s.root.Base, dir)
+		if err := os.MkdirAll(real, 0o750); err != nil {
+			add("storage "+dir, false, err.Error())
+		} else {
+			add("storage "+dir, true, real)
+		}
+	}
+	add("cloudflare client", s.cloudflare.Enabled(), "configured="+strconv.FormatBool(s.cloudflare.Enabled()))
+	add("share store", s.links != nil, strconv.Itoa(len(s.links.List()))+" links")
+	add("activity store", s.activity != nil, "ready")
+	add("turnstile", s.cfg.TurnstileSecret != "", "configured="+strconv.FormatBool(s.cfg.TurnstileSecret != ""))
+	writeJSON(w, http.StatusOK, map[string]any{"checks": checks, "time": time.Now().UTC()})
+}
+
+func (s *Server) sharesAPI(w http.ResponseWriter, r *http.Request, p principal) {
+	switch r.Method {
+	case http.MethodGet:
+		writeJSON(w, http.StatusOK, map[string]any{"links": s.links.List()})
+	case http.MethodPost:
+		var req struct {
+			Kind           string `json:"kind"`
+			Path           string `json:"path"`
+			Label          string `json:"label"`
+			ExpiresIn      string `json:"expires_in"`
+			Password       string `json:"password"`
+			MaxDownloads   int    `json:"max_downloads"`
+			AllowOverwrite bool   `json:"allow_overwrite"`
+		}
+		if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+			writeJSON(w, http.StatusBadRequest, errorBody("bad json"))
+			return
+		}
+		if req.Kind == "" {
+			req.Kind = string(share.KindDownload)
+		}
+		realPath, clean, err := s.root.ResolveAdmin(req.Path)
+		if err != nil {
+			writeJSON(w, http.StatusBadRequest, errorBody("bad path"))
+			return
+		}
+		if req.Kind == string(share.KindDownload) {
+			if _, err := s.root.Stat(realPath); err != nil {
+				writeJSON(w, http.StatusNotFound, errorBody("path not found"))
+				return
+			}
+		} else if err := s.root.MkdirAll(realPath, 0o750); err != nil {
+			writeJSON(w, http.StatusInternalServerError, errorBody(err.Error()))
+			return
+		}
+		var expires time.Time
+		if req.ExpiresIn != "" {
+			d, err := time.ParseDuration(req.ExpiresIn)
+			if err != nil {
+				writeJSON(w, http.StatusBadRequest, errorBody("bad expires_in duration"))
+				return
+			}
+			expires = time.Now().Add(d)
+		}
+		created, err := s.links.Create(share.CreateRequest{Kind: share.Kind(req.Kind), Path: clean, Label: req.Label, CreatedBy: p.User.Username, ExpiresAt: expires, MaxDownloads: req.MaxDownloads, Password: req.Password, AllowOverwrite: req.AllowOverwrite})
+		if err != nil {
+			writeJSON(w, http.StatusBadRequest, errorBody(err.Error()))
+			return
+		}
+		prefix := "/share/"
+		if created.Link.Kind == share.KindUpload {
+			prefix = "/drop/"
+		}
+		url := absoluteURL(r, prefix+created.Link.ID+"/"+created.Token)
+		s.logActivity(activity.Event{Type: "admin_share", Protocol: "http", Actor: p.User.Username, Remote: remoteAddr(r), Action: "create " + string(created.Link.Kind), Path: clean, Detail: "created public link"})
+		writeJSON(w, http.StatusOK, map[string]any{"link": created.Link, "url": url})
+	default:
+		writeJSON(w, http.StatusMethodNotAllowed, errorBody("method not allowed"))
+	}
+}
+
+func (s *Server) shareAPI(w http.ResponseWriter, r *http.Request, p principal) {
+	id := strings.Trim(strings.TrimPrefix(r.URL.Path, "/api/shares/"), "/")
+	if id == "" {
+		writeJSON(w, http.StatusBadRequest, errorBody("id is required"))
+		return
+	}
+	if r.Method != http.MethodDelete {
+		writeJSON(w, http.StatusMethodNotAllowed, errorBody("method not allowed"))
+		return
+	}
+	if err := s.links.Delete(id); err != nil {
+		writeJSON(w, http.StatusNotFound, errorBody(err.Error()))
+		return
+	}
+	s.logActivity(activity.Event{Type: "admin_share", Protocol: "http", Actor: p.User.Username, Remote: remoteAddr(r), Action: "delete", Path: id, Detail: "deleted public link"})
+	writeJSON(w, http.StatusOK, map[string]bool{"ok": true})
+}
+
+func (s *Server) retentionAPI(w http.ResponseWriter, r *http.Request, _ principal) {
+	if r.Method != http.MethodGet {
+		writeJSON(w, http.StatusMethodNotAllowed, errorBody("method not allowed"))
+		return
+	}
+	kind := r.URL.Query().Get("kind")
+	items, err := s.root.ListRetained(kind)
+	if err != nil {
+		writeJSON(w, http.StatusInternalServerError, errorBody(err.Error()))
+		return
+	}
+	writeJSON(w, http.StatusOK, map[string]any{"items": items})
+}
+
+func (s *Server) restoreAPI(w http.ResponseWriter, r *http.Request, p principal) {
+	if r.Method != http.MethodPost {
+		writeJSON(w, http.StatusMethodNotAllowed, errorBody("method not allowed"))
+		return
+	}
+	var req struct {
+		Kind      string `json:"kind"`
+		ID        string `json:"id"`
+		DestPath  string `json:"dest_path"`
+		Overwrite bool   `json:"overwrite"`
+	}
+	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+		writeJSON(w, http.StatusBadRequest, errorBody("bad json"))
+		return
+	}
+	dest, err := s.root.Restore(req.Kind, req.ID, req.DestPath, req.Overwrite)
+	if err != nil {
+		writeJSON(w, http.StatusBadRequest, errorBody(err.Error()))
+		return
+	}
+	s.logActivity(activity.Event{Type: "admin_retention", Protocol: "http", Actor: p.User.Username, Remote: remoteAddr(r), Action: "restore", Path: dest, Detail: "restored retained file"})
+	writeJSON(w, http.StatusOK, map[string]any{"path": dest})
 }
 
 func (s *Server) requireAdmin(next func(http.ResponseWriter, *http.Request, principal)) http.HandlerFunc {
@@ -839,6 +1203,39 @@ func (s *Server) verifySession(raw string) (string, bool) {
 	return parts[0], true
 }
 
+func (s *Server) verifyTurnstile(r *http.Request, token string) error {
+	if s.cfg.TurnstileSecret == "" {
+		return nil
+	}
+	if token == "" {
+		return errors.New("missing Turnstile token")
+	}
+	form := url.Values{}
+	form.Set("secret", s.cfg.TurnstileSecret)
+	form.Set("response", token)
+	form.Set("remoteip", remoteAddr(r))
+	req, err := http.NewRequestWithContext(r.Context(), http.MethodPost, "https://challenges.cloudflare.com/turnstile/v0/siteverify", strings.NewReader(form.Encode()))
+	if err != nil {
+		return err
+	}
+	req.Header.Set("Content-Type", "application/x-www-form-urlencoded")
+	resp, err := http.DefaultClient.Do(req)
+	if err != nil {
+		return err
+	}
+	defer resp.Body.Close()
+	var body struct {
+		Success bool `json:"success"`
+	}
+	if err := json.NewDecoder(io.LimitReader(resp.Body, 1<<20)).Decode(&body); err != nil {
+		return err
+	}
+	if !body.Success {
+		return errors.New("Turnstile denied token")
+	}
+	return nil
+}
+
 func sanitizeUser(user auth.User) auth.User {
 	user.PasswordHash = ""
 	return user
@@ -847,6 +1244,7 @@ func sanitizeUser(user auth.User) auth.User {
 type publicEntry struct {
 	Name     string
 	Href     string
+	InfoHref string
 	Size     int64
 	SizeText string
 	IsDir    bool
@@ -957,6 +1355,42 @@ func requestIsHTTPS(r *http.Request) bool {
 	return strings.EqualFold(r.Header.Get("X-Forwarded-Proto"), "https") || strings.EqualFold(r.Header.Get("CF-Visitor"), `{"scheme":"https"}`)
 }
 
+func linkParts(urlPath, prefix string) (string, string, bool) {
+	rest := strings.Trim(strings.TrimPrefix(urlPath, prefix), "/")
+	parts := strings.Split(rest, "/")
+	if len(parts) < 2 || parts[0] == "" || parts[1] == "" {
+		return "", "", false
+	}
+	return parts[0], parts[1], true
+}
+
+func absoluteURL(r *http.Request, p string) string {
+	scheme := "http"
+	if requestIsHTTPS(r) {
+		scheme = "https"
+	}
+	host := r.Host
+	if forwarded := strings.TrimSpace(r.Header.Get("X-Forwarded-Host")); forwarded != "" {
+		host = forwarded
+	}
+	if publicHost := strings.TrimSpace(r.Header.Get("X-Macftpd-Public-Host")); publicHost != "" {
+		host = publicHost
+	}
+	return (&url.URL{Scheme: scheme, Host: host, Path: p}).String()
+}
+
+func publicURLForVirtual(root *storage.Root, virtual string) string {
+	virtual = path.Clean("/" + strings.TrimPrefix(virtual, "/"))
+	publicRoot := "/" + root.PublicDir
+	if virtual == publicRoot {
+		return "/public/"
+	}
+	if strings.HasPrefix(virtual, publicRoot+"/") {
+		return "/public/" + strings.TrimPrefix(virtual, publicRoot+"/")
+	}
+	return "/public/"
+}
+
 func errorBody(msg string) map[string]string {
 	return map[string]string{"error": msg}
 }
@@ -977,6 +1411,19 @@ func securityHeaders(next http.Handler) http.Handler {
 		next.ServeHTTP(w, r)
 	})
 }
+
+var fileInfoTemplate = template.Must(template.New("fileInfo").Parse(`<!doctype html>
+<html lang="en"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width, initial-scale=1">
+<title>{{.Title}}</title><style>body{font-family:-apple-system,BlinkMacSystemFont,"Segoe UI",sans-serif;margin:0;background:#f6f7f4;color:#151716}main{max-width:760px;margin:8vh auto;padding:24px}.panel{background:#fff;border:1px solid #d9dfdb;border-radius:8px;padding:22px}dl{display:grid;grid-template-columns:120px 1fr;gap:10px}dt{color:#68716b}a.button{display:inline-block;margin-top:16px;background:#17645b;color:#fff;text-decoration:none;padding:10px 14px;border-radius:6px}.mono{font-family:ui-monospace,Menlo,monospace;word-break:break-all}</style></head>
+<body><main><section class="panel"><h1>{{.Name}}</h1><dl><dt>Path</dt><dd class="mono">{{.Path}}</dd><dt>Type</dt><dd>{{.Type}}</dd><dt>Size</dt><dd>{{.Size}}</dd><dt>Modified</dt><dd>{{.ModTime}}</dd></dl><a class="button" href="{{.Href}}">Download</a></section></main></body></html>`))
+
+var passwordTemplate = template.Must(template.New("sharePassword").Parse(`<!doctype html>
+<html lang="en"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width, initial-scale=1"><title>{{.Title}}</title><style>body{font-family:-apple-system,BlinkMacSystemFont,"Segoe UI",sans-serif;background:#f6f7f4;margin:0}main{max-width:420px;margin:12vh auto;background:#fff;border:1px solid #d9dfdb;border-radius:8px;padding:22px}input,button{font:inherit;padding:10px;width:100%;box-sizing:border-box}button{margin-top:10px;background:#17645b;color:#fff;border:0;border-radius:6px}</style></head>
+<body><main><h1>{{.Title}}</h1><form method="post"><input type="password" name="password" autocomplete="current-password" placeholder="Password"><button>Open</button></form></main></body></html>`))
+
+var dropTemplate = template.Must(template.New("drop").Parse(`<!doctype html>
+<html lang="en"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width, initial-scale=1"><title>Upload drop</title><style>body{font-family:-apple-system,BlinkMacSystemFont,"Segoe UI",sans-serif;background:#f6f7f4;margin:0}main{max-width:520px;margin:10vh auto;background:#fff;border:1px solid #d9dfdb;border-radius:8px;padding:22px}input,button{font:inherit;padding:10px;width:100%;box-sizing:border-box}button{margin-top:10px;background:#17645b;color:#fff;border:0;border-radius:6px}.mono{font-family:ui-monospace,Menlo,monospace}</style></head>
+<body><main><h1>Upload Drop</h1><p class="mono">{{.Path}}</p><form method="post" enctype="multipart/form-data"><input type="file" name="file" required><button>Upload</button></form></main></body></html>`))
 
 var adminTemplate = template.Must(template.New("admin").Parse(`<!doctype html>
 <html lang="en">
@@ -1015,7 +1462,10 @@ table{width:100%;border-collapse:collapse}th,td{text-align:left;border-bottom:1p
 <p><button onclick="saveUser()">Save user</button></p><pre id="status"></pre></section>
 <section class="panel"><h2>Users</h2><table><thead><tr><th>User</th><th>Home</th><th>Groups</th><th>Disabled</th><th></th></tr></thead><tbody id="users"></tbody></table></section>
 <section class="panel wide"><div class="toolbar"><h2>Files</h2><div class="muted" id="fileHeaderStatus">Ready</div></div><div class="file-top"><button class="icon" id="upBtn" title="Up one folder">Up</button><button class="icon" id="homeBtn" title="Storage root">/</button><div class="file-path-wrap"><span>/</span><input id="path" value="/" spellcheck="false"></div><button class="primary" id="goBtn">Go</button></div><div class="crumbs" id="crumbs"></div><div class="file-shell"><div><div class="file-tools"><input id="fileSearch" placeholder="Filter files"><button id="refreshBtn">Refresh</button><button id="mkdirBtn">New folder</button><button id="copySelectedBtn">Copy selected</button><button id="moveSelectedBtn">Move selected</button><button id="bulkDeleteBtn">Delete selected</button><button id="clearSelectionBtn">Clear</button></div><div class="file-summary" id="fileSummary"></div><div class="file-list-wrap"><table class="file-table"><thead><tr><th class="file-check"><input id="selectAllFiles" type="checkbox" title="Select all"></th><th><button data-sort="name">Name <span id="sort-name" class="sort-mark"></span></button></th><th class="right"><button data-sort="size">Size <span id="sort-size" class="sort-mark"></span></button></th><th><button data-sort="mod_time">Modified <span id="sort-mod_time" class="sort-mark"></span></button></th><th>Actions</th></tr></thead><tbody id="files"><tr><td colspan="5" class="empty-state">Loading...</td></tr></tbody></table></div><div id="dropzone" class="dropzone"><form id="uploadForm" enctype="multipart/form-data"><label>Upload to current folder</label><div class="row"><input id="uploadFile" type="file" multiple><button>Upload</button></div></form></div><div id="fileStatus" class="toast"></div></div><aside id="fileInfo" class="file-card"></aside></div></section>
-<section class="panel"><h2>Cloudflare</h2><button onclick="purge()">Purge public cache</button><pre id="cf"></pre></section>
+<section class="panel"><h2>Cloudflare / Doctor</h2><div class="row"><button onclick="purge()">Purge public cache</button><button id="doctorBtn">Run doctor</button></div><pre id="cf"></pre></section>
+<section class="panel"><h2>Links</h2><div class="row"><select id="linkKind"><option value="download">Share</option><option value="upload">Drop</option></select><input id="linkPath" value="/public"></div><div class="row"><input id="linkExpires" placeholder="Expiry e.g. 24h"><input id="linkPassword" type="password" placeholder="Password optional"></div><p><button id="createLinkBtn">Create link</button></p><pre id="linksOut"></pre></section>
+<section class="panel"><h2>Trash / versions</h2><div class="row"><button id="loadTrashBtn">Trash</button><button id="loadVersionsBtn">Versions</button></div><div id="retentionList" class="activity-feed"></div></section>
+<section class="panel wide"><div class="toolbar"><h2>Live status</h2><button id="refreshStatusBtn">Refresh</button></div><div id="liveStatus" class="activity-feed"></div></section>
 <section class="panel wide"><div class="toolbar"><h2>Activity</h2><button id="refreshActivityBtn">Refresh</button></div><div id="activityFeed" class="activity-feed"><div class="muted">Loading activity...</div></div></section>
 </main>
 <script>
@@ -1061,9 +1511,15 @@ async function copyText(text){try{await navigator.clipboard.writeText(text);setF
 function renderActivity(){byId('activityFeed').innerHTML=activityRows.map(e=>'<div class="activity-item"><div class="activity-time">'+esc(new Date(e.time).toLocaleTimeString())+'</div><div><div class="activity-msg">'+esc(e.message||'Activity')+'</div><div class="activity-meta">'+esc([e.actor,e.protocol,e.remote].filter(Boolean).join(' - '))+'</div></div><div class="activity-pill '+attr(e.outcome||'ok')+'">'+esc(e.outcome||'ok')+'</div></div>').join('')||'<div class="muted">No activity yet.</div>'}
 async function loadActivity(){try{const data=await api('/api/activity?limit=80');activityRows=data.events||[];activityLastID=activityRows.reduce((m,e)=>Math.max(m,e.id||0),activityLastID);renderActivity()}catch(e){byId('activityFeed').innerHTML='<div class="danger-text">'+esc(e.message)+'</div>'}}
 async function pollActivity(){try{const data=await api('/api/activity?limit=80&after='+activityLastID);const fresh=data.events||[];if(fresh.length){activityRows=[...fresh,...activityRows].sort((a,b)=>b.id-a.id).slice(0,80);activityLastID=activityRows.reduce((m,e)=>Math.max(m,e.id||0),activityLastID);renderActivity()}}catch(e){}}
-function bindFileBrowser(){byId('goBtn').addEventListener('click',()=>goPath(byId('path').value));byId('path').addEventListener('keydown',e=>{if(e.key==='Enter')goPath(byId('path').value)});byId('upBtn').addEventListener('click',()=>goPath(parentPath(currentPath)));byId('homeBtn').addEventListener('click',()=>goPath('/'));byId('refreshBtn').addEventListener('click',()=>loadFiles(currentPath,{replace:true,selected:selectedPath}));byId('mkdirBtn').addEventListener('click',mkdir);byId('copySelectedBtn').addEventListener('click',()=>fileAction('copy'));byId('moveSelectedBtn').addEventListener('click',()=>fileAction('move'));byId('bulkDeleteBtn').addEventListener('click',bulkDelete);byId('clearSelectionBtn').addEventListener('click',()=>{selectedFiles.clear();selectedPath='';renderFiles();history.replaceState({path:currentPath,selected:''},'',stateURL(currentPath,''))});byId('fileSearch').addEventListener('input',renderFiles);byId('selectAllFiles').addEventListener('change',e=>{if(e.target.checked)visibleRows().forEach(r=>selectedFiles.add(r.path));else selectedFiles.clear();renderFiles()});document.querySelectorAll('.file-table th button[data-sort]').forEach(b=>b.addEventListener('click',()=>sortFiles(b.dataset.sort)));byId('uploadForm').addEventListener('submit',e=>{e.preventDefault();uploadFiles(byId('uploadFile').files)});byId('refreshActivityBtn').addEventListener('click',loadActivity);const dz=byId('dropzone');for(const ev of ['dragenter','dragover'])dz.addEventListener(ev,e=>{e.preventDefault();dz.classList.add('drag')});for(const ev of ['dragleave','drop'])dz.addEventListener(ev,e=>{e.preventDefault();dz.classList.remove('drag')});dz.addEventListener('drop',e=>uploadFiles(e.dataTransfer.files));window.addEventListener('popstate',()=>{selectedPath=initialSelected();loadFiles(initialPath(),{replace:false,selected:selectedPath})})}
+async function loadLiveStatus(){try{const data=await api('/api/status');const rows=data.sessions||[];byId('liveStatus').innerHTML=rows.map(s=>'<div class="activity-item"><div class="activity-time">'+esc(s.protocol)+' #'+esc(s.id)+'</div><div><div class="activity-msg">'+esc([s.user||'anonymous',s.action||'connected',s.path||''].filter(Boolean).join(' - '))+'</div><div class="activity-meta">'+esc([s.remote,s.secure?'TLS':'clear',s.mode,s.bytes?sizeText(s.bytes,false):''].filter(Boolean).join(' - '))+'</div></div><div class="activity-pill ok">'+esc(new Date(s.updated_at).toLocaleTimeString())+'</div></div>').join('')||'<div class="muted">No active sessions.</div>'}catch(e){byId('liveStatus').innerHTML='<div class="danger-text">'+esc(e.message)+'</div>'}}
+async function createLink(){try{const body={kind:byId('linkKind').value,path:byId('linkPath').value,expires_in:byId('linkExpires').value,password:byId('linkPassword').value,allow_overwrite:true};const data=await api('/api/shares',{method:'POST',body:JSON.stringify(body)});byId('linksOut').textContent=data.url;loadLinks()}catch(e){byId('linksOut').textContent=e.message}}
+async function loadLinks(){try{const data=await api('/api/shares');if(!byId('linksOut').textContent)byId('linksOut').textContent=(data.links||[]).map(l=>l.kind+' '+l.path+' '+l.id+(l.expires_at?' expires '+new Date(l.expires_at).toLocaleString():'')).join('\n')}catch(e){}}
+async function loadRetention(kind){try{const data=await api('/api/retention?kind='+encodeURIComponent(kind));byId('retentionList').innerHTML=(data.items||[]).map(i=>'<div class="activity-item"><div class="activity-time">'+esc(kind)+'</div><div><div class="activity-msg">'+esc(i.original_path)+'</div><div class="activity-meta">'+esc([i.id,i.is_dir?'folder':sizeText(i.size,false)].join(' - '))+'</div></div><button data-restore="'+attr(i.id)+'" data-kind="'+attr(kind)+'">Restore</button></div>').join('')||'<div class="muted">Nothing retained.</div>';byId('retentionList').querySelectorAll('[data-restore]').forEach(b=>b.addEventListener('click',()=>restoreRetained(b.dataset.kind,b.dataset.restore)))}catch(e){byId('retentionList').innerHTML='<div class="danger-text">'+esc(e.message)+'</div>'}}
+async function restoreRetained(kind,id){try{const dest=prompt('Restore to path (blank for original)','');await api('/api/retention/restore',{method:'POST',body:JSON.stringify({kind,id,dest_path:dest,overwrite:false})});loadRetention(kind);loadFiles(currentPath,{replace:true})}catch(e){alert(e.message)}}
+function bindFileBrowser(){byId('goBtn').addEventListener('click',()=>goPath(byId('path').value));byId('path').addEventListener('keydown',e=>{if(e.key==='Enter')goPath(byId('path').value)});byId('upBtn').addEventListener('click',()=>goPath(parentPath(currentPath)));byId('homeBtn').addEventListener('click',()=>goPath('/'));byId('refreshBtn').addEventListener('click',()=>loadFiles(currentPath,{replace:true,selected:selectedPath}));byId('mkdirBtn').addEventListener('click',mkdir);byId('copySelectedBtn').addEventListener('click',()=>fileAction('copy'));byId('moveSelectedBtn').addEventListener('click',()=>fileAction('move'));byId('bulkDeleteBtn').addEventListener('click',bulkDelete);byId('clearSelectionBtn').addEventListener('click',()=>{selectedFiles.clear();selectedPath='';renderFiles();history.replaceState({path:currentPath,selected:''},'',stateURL(currentPath,''))});byId('fileSearch').addEventListener('input',renderFiles);byId('selectAllFiles').addEventListener('change',e=>{if(e.target.checked)visibleRows().forEach(r=>selectedFiles.add(r.path));else selectedFiles.clear();renderFiles()});document.querySelectorAll('.file-table th button[data-sort]').forEach(b=>b.addEventListener('click',()=>sortFiles(b.dataset.sort)));byId('uploadForm').addEventListener('submit',e=>{e.preventDefault();uploadFiles(byId('uploadFile').files)});byId('refreshActivityBtn').addEventListener('click',loadActivity);byId('refreshStatusBtn').addEventListener('click',loadLiveStatus);byId('createLinkBtn').addEventListener('click',createLink);byId('doctorBtn').addEventListener('click',doctor);byId('loadTrashBtn').addEventListener('click',()=>loadRetention('trash'));byId('loadVersionsBtn').addEventListener('click',()=>loadRetention('versions'));const dz=byId('dropzone');for(const ev of ['dragenter','dragover'])dz.addEventListener(ev,e=>{e.preventDefault();dz.classList.add('drag')});for(const ev of ['dragleave','drop'])dz.addEventListener(ev,e=>{e.preventDefault();dz.classList.remove('drag')});dz.addEventListener('drop',e=>uploadFiles(e.dataTransfer.files));window.addEventListener('popstate',()=>{selectedPath=initialSelected();loadFiles(initialPath(),{replace:false,selected:selectedPath})})}
 async function purge(){try{byId('cf').textContent=JSON.stringify(await api('/api/cloudflare/purge',{method:'POST',body:'{}'}),null,2)}catch(e){byId('cf').textContent=e.message}}
-async function init(){try{await loginFromURLCredentials()}catch(e){byId('status').textContent='Login setup failed: '+e.message;return}bindFileBrowser();selectedPath=initialSelected();history.replaceState({path:initialPath(),selected:selectedPath},'',stateURL(initialPath(),selectedPath));loadUsers();loadFiles(initialPath(),{selected:selectedPath});loadActivity();setInterval(pollActivity,3000)}
+async function doctor(){try{byId('cf').textContent=JSON.stringify(await api('/api/doctor'),null,2)}catch(e){byId('cf').textContent=e.message}}
+async function init(){try{await loginFromURLCredentials()}catch(e){byId('status').textContent='Login setup failed: '+e.message;return}bindFileBrowser();selectedPath=initialSelected();history.replaceState({path:initialPath(),selected:selectedPath},'',stateURL(initialPath(),selectedPath));loadUsers();loadFiles(initialPath(),{selected:selectedPath});loadActivity();loadLiveStatus();loadLinks();setInterval(pollActivity,3000);setInterval(loadLiveStatus,3000)}
 init();
 </script>
 </body></html>`))
@@ -1088,7 +1544,7 @@ table{width:100%;border-collapse:collapse;background:#fff;border:1px solid #d9e0
 <main>
 {{if .Parent}}<p class="parent"><a href="{{.Parent}}">Up one folder</a></p>{{end}}
 <table id="listing"><thead><tr><th><button data-sort="name">Name</button></th><th class="right"><button data-sort="size">Size</button></th><th><button data-sort="modified">Modified</button></th></tr></thead><tbody>
-{{range .Rows}}<tr data-name="{{.Name}}" data-size="{{.Size}}" data-modified="{{.ModTime.Unix}}"><td class="name"><span class="icon">{{if .IsDir}}[+]{{else}}--{{end}}</span><a href="{{.Href}}">{{.Name}}</a></td><td class="right mono">{{.SizeText}}</td><td class="mono">{{.ModText}}</td></tr>{{else}}<tr><td colspan="3" class="empty">This folder is empty.</td></tr>{{end}}
+{{range .Rows}}<tr data-name="{{.Name}}" data-size="{{.Size}}" data-modified="{{.ModTime.Unix}}"><td class="name"><span class="icon">{{if .IsDir}}[+]{{else}}--{{end}}</span><a href="{{.Href}}">{{.Name}}</a> {{if not .IsDir}}<a class="meta" href="{{.InfoHref}}">info</a>{{end}}</td><td class="right mono">{{.SizeText}}</td><td class="mono">{{.ModText}}</td></tr>{{else}}<tr><td colspan="3" class="empty">This folder is empty.</td></tr>{{end}}
 </tbody></table>
 </main>
 <script>

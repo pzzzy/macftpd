@@ -1,16 +1,20 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-REMOTE="${REMOTE:-deployer@example-host}"
-KEY="${KEY:-~/.ssh/id_ed25519}"
+REMOTE="${REMOTE:-macftpd@example-host.local}"
+KEY="${KEY:-}"
 HOST="${HOST:-}"
 HTTP_PORT="${HTTP_PORT:-8080}"
 FTP_PORT="${FTP_PORT:-2121}"
 ADMIN_USER="${ADMIN_USER:-admin}"
 ADMIN_PASS="${ADMIN_PASS:?set ADMIN_PASS to the deployed admin password}"
+SSH_OPTS=()
+if [[ -n "${KEY}" ]]; then
+  SSH_OPTS=(-i "${KEY}")
+fi
 
 if [[ -z "${HOST}" ]]; then
-  HOST="$(ssh -i "${KEY}" -o BatchMode=yes -o ConnectTimeout=5 "${REMOTE}" "ipconfig getifaddr en0 || ipconfig getifaddr en1 || ifconfig | awk '/inet / && !/127.0.0.1/ {print \\\$2; exit}'" 2>/dev/null || true)"
+  HOST="$(ssh "${SSH_OPTS[@]}" -o BatchMode=yes -o ConnectTimeout=5 "${REMOTE}" "ipconfig getifaddr en0 || ipconfig getifaddr en1 || ifconfig | awk '/inet / && !/127.0.0.1/ {print \\\$2; exit}'" 2>/dev/null || true)"
 fi
 if [[ -z "${HOST}" ]]; then
   HOST="example-host.local"
