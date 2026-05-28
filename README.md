@@ -56,8 +56,8 @@ The first deploy writes `/opt/macftpd/config.json`. Later deploys merge generate
 Override `REMOTE_DIR` and `STORAGE_ROOT` for site-specific installs, for example a home-directory app folder with an external-volume FTP root:
 
 ```bash
-REMOTE='luke@m4m.local' KEY='.ssh/id_ed25519' \
-REMOTE_DIR='/Users/luke/macftpd' STORAGE_ROOT='/Volumes/T4T/ftpd' \
+REMOTE='macftpd@example-host.local' KEY='/path/to/ssh-key' \
+REMOTE_DIR='~/macftpd' STORAGE_ROOT='/path/to/ftpd-storage' \
 ADMIN_PASS='choose-a-strong-password' ./scripts/deploy-remote-macos.sh
 ```
 
@@ -125,22 +125,24 @@ Expiry presets in the admin UI are `1 download`, `1h`, `12h`, `24h`, `1w`, `1m`,
 All `/api/*` endpoints require an admin session or HTTP Basic auth unless noted. Unsafe methods enforce same-origin checks using `Origin`, Fetch Metadata, and Cloudflare forwarded-host headers.
 
 ```bash
+auth=(-u "$MACFTPD_ADMIN_USER:$MACFTPD_ADMIN_PASS")
+
 # Create a direct download share.
-curl -u admin:... -H 'content-type: application/json' \
+curl "${auth[@]}" -H 'content-type: application/json' \
   -d '{"kind":"download","path":"/public/example.mp4","expires_in":"24h"}' \
   https://ftp.example.com/api/shares
 
 # Create a password-protected public upload drop.
-curl -u admin:... -H 'content-type: application/json' \
+curl "${auth[@]}" -H 'content-type: application/json' \
   -d '{"kind":"upload","path":"/public","expires_in":"1h","password":"optional"}' \
   https://ftp.example.com/api/shares
 
 # List and revoke links.
-curl -u admin:... https://ftp.example.com/api/shares
-curl -u admin:... -X DELETE https://ftp.example.com/api/shares/<id>
+curl "${auth[@]}" https://ftp.example.com/api/shares
+curl "${auth[@]}" -X DELETE https://ftp.example.com/api/shares/<id>
 
 # Inspect public/share download stats for a storage path.
-curl -u admin:... 'https://ftp.example.com/api/stats?path=/public/example.mp4'
+curl "${auth[@]}" 'https://ftp.example.com/api/stats?path=/public/example.mp4'
 ```
 
 Other admin endpoints include `/api/users`, `/api/groups`, `/api/files`, `/api/files/action`, `/api/upload/chunk`, `/api/download`, `/api/fxp`, `/api/activity`, `/api/status`, `/api/doctor`, `/api/retention`, `/api/retention/restore`, and `/api/cloudflare/purge`.
@@ -153,6 +155,7 @@ Before a release candidate, run:
 go test ./...
 go test -race ./...
 go vet ./...
+./scripts/check-private-identifiers.sh
 go run github.com/securego/gosec/v2/cmd/gosec@latest ./...
 go run golang.org/x/vuln/cmd/govulncheck@latest ./...
 wrangler deploy --config cloudflare/wrangler.jsonc --dry-run
