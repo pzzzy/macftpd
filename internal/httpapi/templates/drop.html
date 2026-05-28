@@ -1,0 +1,39 @@
+<!doctype html>
+<html lang="en" data-theme="macftpd">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>Upload drop</title>
+  <link rel="stylesheet" href="/assets/macftpd.css">
+</head>
+<body>
+  <main class="mx-auto max-w-xl p-5 pt-[10vh]">
+    <section class="mac-panel rounded-box p-6">
+      <div class="flex items-start justify-between gap-4">
+        <div>
+          <p class="mac-section-title">Upload Drop</p>
+          <h1 class="mt-1 text-2xl font-semibold">Send files</h1>
+        </div>
+        {{if .HasPassword}}<span class="badge badge-ghost">protected</span>{{end}}
+      </div>
+      <p class="mt-3 break-all font-mono text-sm text-base-content/60">{{.Path}}</p>
+      <form id="drop-form" class="mt-5 rounded-box border border-dashed border-base-300 bg-base-100 p-5">
+        <input id="drop-file" class="file-input file-input-bordered w-full" type="file" name="file" multiple required>
+        <button class="btn btn-primary mt-3 w-full">Upload</button>
+      </form>
+      <div id="drop-status" class="mt-4 min-h-8 text-sm"></div>
+    </section>
+  </main>
+  <script>
+    const form=document.getElementById("drop-form"),input=document.getElementById("drop-file"),status=document.getElementById("drop-status");
+    function uploadID(){const a=new Uint8Array(12);crypto.getRandomValues(a);return [...a].map((x)=>x.toString(16).padStart(2,"0")).join("")}
+    async function parse(r){let j={};try{j=await r.json()}catch{const t=await r.text().catch(()=>"");j={error:t||r.statusText}}if(!r.ok)throw new Error(j.error||r.statusText);return j}
+    async function uploadOne(f,i,total){const id=uploadID(),chunkSize=16*1024*1024;let offset=0,last=null;if(f.size===0){const fd=new FormData();fd.append("filename",f.name);fd.append("upload_id",id);fd.append("offset","0");fd.append("total_size","0");fd.append("chunk",new Blob([]),f.name);return parse(await fetch(location.href,{method:"POST",body:fd}))}while(offset<f.size){const end=Math.min(offset+chunkSize,f.size),fd=new FormData();fd.append("filename",f.name);fd.append("upload_id",id);fd.append("offset",String(offset));fd.append("total_size",String(f.size));fd.append("chunk",f.slice(offset,end),f.name);status.innerHTML='<div class="alert py-2">Uploading '+i+"/"+total+" "+f.name+" "+Math.floor(end/f.size*100)+"%</div>';last=await parse(await fetch(location.href,{method:"POST",body:fd}));offset=end}return last}
+    async function upload(files){files=[...files];let links=[];for(let i=0;i<files.length;i++){const result=await uploadOne(files[i],i+1,files.length);if(result&&result.public_url)links.push(result.public_url)}status.innerHTML=links.length?'<div class="alert alert-success py-2"><div><div>Upload complete</div>'+links.map((u)=>'<a class="block break-all font-mono text-primary" href="'+u+'">'+u+"</a>").join("")+"</div></div>":'<div class="alert alert-success py-2">Upload complete</div>';input.value=""}
+    form.addEventListener("submit",(e)=>{e.preventDefault();upload(input.files).catch((err)=>status.innerHTML='<div class="alert alert-error py-2">'+err.message+"</div>")});
+    ["dragenter","dragover"].forEach((ev)=>form.addEventListener(ev,(e)=>{e.preventDefault();form.classList.add("drop-active")}));
+    ["dragleave","drop"].forEach((ev)=>form.addEventListener(ev,(e)=>{e.preventDefault();form.classList.remove("drop-active")}));
+    form.addEventListener("drop",(e)=>upload(e.dataTransfer.files).catch((err)=>status.innerHTML='<div class="alert alert-error py-2">'+err.message+"</div>"));
+  </script>
+</body>
+</html>

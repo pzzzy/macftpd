@@ -1,0 +1,54 @@
+<!doctype html>
+<html lang="en" data-theme="macftpd">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>Public files {{.Path}}</title>
+  <link rel="stylesheet" href="/assets/macftpd.css">
+</head>
+<body>
+  <header class="border-b border-base-300 bg-white">
+    <div class="mx-auto max-w-6xl px-4 py-6">
+      <h1 class="text-3xl font-semibold">Public Files</h1>
+      <p class="mt-2 break-all font-mono text-sm text-base-content/60">{{.Path}} · updated {{.Updated}}</p>
+    </div>
+  </header>
+  <main class="mx-auto max-w-6xl px-4 py-5">
+    {{if .Parent}}<a class="btn btn-sm btn-ghost mb-4" href="{{.Parent}}">↑ Up one folder</a>{{end}}
+    <div class="mb-3 flex flex-wrap items-center justify-between gap-2">
+      <label class="input input-bordered input-sm flex min-w-64 items-center gap-2">
+        <span class="text-base-content/50">Filter</span>
+        <input id="listing-filter" type="search" class="grow" autocomplete="off">
+      </label>
+      <span class="text-sm text-base-content/60">{{len .Rows}} item{{if ne (len .Rows) 1}}s{{end}}</span>
+    </div>
+    <div class="overflow-hidden rounded-box border border-base-300 bg-white">
+      <table id="listing" class="table table-sm">
+        <thead><tr><th><button data-sort="name">Name</button></th><th class="text-right"><button data-sort="size">Size</button></th><th class="hidden md:table-cell"><button data-sort="modified">Modified</button></th></tr></thead>
+        <tbody>
+          {{range .Rows}}
+            <tr data-name="{{.Name}}" data-size="{{.Size}}" data-modified="{{.ModTime.Unix}}">
+              <td class="min-w-0">
+                <div class="flex items-center gap-2">
+                  <span class="badge badge-sm {{if .IsDir}}badge-primary{{else}}badge-ghost{{end}}">{{if .IsDir}}DIR{{else}}FILE{{end}}</span>
+                  <a class="truncate font-medium text-primary hover:underline" href="{{.Href}}">{{.Name}}</a>
+                  {{if not .IsDir}}<a class="text-xs text-base-content/50 hover:text-primary" href="{{.InfoHref}}">info</a>{{end}}
+                </div>
+              </td>
+              <td class="text-right font-mono text-xs">{{.SizeText}}</td>
+              <td class="hidden font-mono text-xs md:table-cell">{{.ModText}}</td>
+            </tr>
+          {{else}}
+            <tr><td colspan="3" class="py-10 text-center text-base-content/60">This folder is empty.</td></tr>
+          {{end}}
+        </tbody>
+      </table>
+    </div>
+  </main>
+  <script>
+    const tbody=document.querySelector("#listing tbody");let active="name",dir=1;
+    document.querySelectorAll("[data-sort]").forEach((button)=>button.addEventListener("click",()=>{const key=button.dataset.sort;dir=active===key?-dir:1;active=key;const rows=[...tbody.querySelectorAll("tr[data-name]")];rows.sort((a,b)=>{let av=a.dataset[key],bv=b.dataset[key];if(key==="name"){av=av.toLowerCase();bv=bv.toLowerCase()}else{av=Number(av);bv=Number(bv)}return av>bv?dir:av<bv?-dir:0});rows.forEach((row)=>tbody.appendChild(row))}));
+    document.getElementById("listing-filter")?.addEventListener("input",(event)=>{const needle=event.target.value.trim().toLowerCase();tbody.querySelectorAll("tr[data-name]").forEach((row)=>row.classList.toggle("hidden",needle&&!row.dataset.name.toLowerCase().includes(needle)))});
+  </script>
+</body>
+</html>

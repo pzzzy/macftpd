@@ -1,0 +1,142 @@
+<div class="grid gap-4 xl:grid-cols-[minmax(0,1fr)_340px]">
+  <section class="mac-panel rounded-box min-w-0 overflow-hidden">
+    <div class="border-b border-base-300 p-4">
+      <div class="flex flex-wrap items-end gap-2">
+        <label class="form-control min-w-64 flex-1">
+          <span class="label-text">Path</span>
+          <div class="join w-full">
+            <input id="file-path" class="input input-bordered join-item w-full font-mono" value="{{.Path}}">
+            <button class="btn join-item" type="button" onclick="macftpd.reloadFiles(document.getElementById('file-path').value)">Go</button>
+          </div>
+        </label>
+        <button class="btn btn-square" title="Root" hx-get="{{partialFilesURL "/" ""}}" hx-target="#file-workspace" hx-push-url="{{adminFilesURL "/" ""}}">⌂</button>
+        <button class="btn btn-square" title="Up" hx-get="{{partialFilesURL .Parent ""}}" hx-target="#file-workspace" hx-push-url="{{adminFilesURL .Parent ""}}">↑</button>
+        <button class="btn" type="button" onclick="macftpd.makeFolder()">New Folder</button>
+      </div>
+
+      <div class="mt-3 flex flex-wrap items-center justify-between gap-2">
+        <div class="breadcrumbs max-w-full overflow-x-auto text-sm">
+          <ul>
+            {{range .Breadcrumbs}}
+              <li><a hx-get="{{partialFilesURL .Path ""}}" hx-target="#file-workspace" hx-push-url="{{adminFilesURL .Path ""}}">{{.Name}}</a></li>
+            {{end}}
+          </ul>
+        </div>
+        <label class="input input-bordered input-sm flex min-w-56 items-center gap-2">
+          <span class="text-base-content/50">Search</span>
+          <input id="file-search" type="search" class="grow" autocomplete="off">
+        </label>
+      </div>
+    </div>
+
+    <div class="grid gap-3 p-4 lg:grid-cols-[1fr_260px]">
+      <div class="min-w-0">
+        <div class="mb-2 flex flex-wrap items-center justify-between gap-2">
+          <div class="text-sm text-base-content/60">{{len .Entries}} item{{if ne (len .Entries) 1}}s{{end}}</div>
+          <div class="flex flex-wrap gap-2">
+            <button class="btn btn-sm" type="button" onclick="macftpd.copyMove('copy')">Copy selected</button>
+            <button class="btn btn-sm" type="button" onclick="macftpd.copyMove('move')">Move selected</button>
+          </div>
+        </div>
+        <div class="max-h-[62vh] overflow-auto rounded-box border border-base-300 mac-scroll">
+          <table class="table table-sm table-pin-rows">
+            <thead>
+              <tr>
+                <th class="w-10"><input id="select-all-files" class="checkbox checkbox-sm" type="checkbox"></th>
+                <th>Name</th>
+                <th class="text-right">Size</th>
+                <th class="hidden md:table-cell">Modified</th>
+                <th class="w-32">Actions</th>
+              </tr>
+            </thead>
+            <tbody>
+              {{range .Entries}}
+                <tr class="mac-file-row {{if and $.Selected (eq $.Selected.Path .Path)}}is-selected{{end}}" data-open-file="{{.Path}}" data-dir="{{.IsDir}}" data-search="{{.Name}} {{.Path}}">
+                  <td><input class="checkbox checkbox-sm" type="checkbox" value="{{.Path}}" data-file-check></td>
+                  <td class="min-w-0">
+                    <button class="flex max-w-full items-center gap-2 text-left"
+                      hx-get="{{partialFilesURL (ifDirPath .Path .IsDir $.Path) (ifFilePath .Path .IsDir)}}"
+                      hx-target="#file-workspace"
+                      hx-push-url="{{adminFilesURL (ifDirPath .Path .IsDir $.Path) (ifFilePath .Path .IsDir)}}">
+                      <span class="badge badge-sm {{if .IsDir}}badge-primary{{else}}badge-ghost{{end}}">{{if .IsDir}}DIR{{else}}FILE{{end}}</span>
+                      <span class="truncate font-medium">{{.Name}}</span>
+                    </button>
+                  </td>
+                  <td class="text-right font-mono text-xs">{{humanSize .Size .IsDir}}</td>
+                  <td class="hidden font-mono text-xs md:table-cell">{{formatDate .ModTime}}</td>
+                  <td>
+                    <div class="flex gap-1">
+                      {{if .IsDir}}
+                        <button class="btn btn-xs" hx-get="{{partialFilesURL .Path ""}}" hx-target="#file-workspace" hx-push-url="{{adminFilesURL .Path ""}}">Open</button>
+                      {{else}}
+                        <button class="btn btn-xs" type="button" onclick="macftpd.download('{{js .Path}}')">Get</button>
+                      {{end}}
+                      <button class="btn btn-xs btn-error btn-outline" type="button" onclick="macftpd.deletePath('{{js .Path}}')">Del</button>
+                    </div>
+                  </td>
+                </tr>
+              {{else}}
+                <tr><td colspan="5" class="py-10 text-center text-base-content/60">This folder is empty.</td></tr>
+              {{end}}
+            </tbody>
+          </table>
+        </div>
+      </div>
+
+      <form id="upload-dropzone" class="rounded-box border border-dashed border-base-300 bg-base-100 p-4">
+        <p class="text-sm font-semibold">Upload here</p>
+        <p class="mt-1 text-xs text-base-content/60">Chunked uploads keep large files moving through Cloudflare and local network interruptions.</p>
+        <input id="upload-files" class="file-input file-input-bordered file-input-sm mt-3 w-full" type="file" multiple>
+      </form>
+    </div>
+  </section>
+
+  <aside class="mac-panel rounded-box min-w-0 p-4">
+    {{if .Selected}}
+      <div data-selected-path="{{.Selected.Path}}">
+        <p class="mac-section-title">Inspector</p>
+        <h2 class="mt-2 break-words text-lg font-semibold">{{.Selected.Name}}</h2>
+        <dl class="mt-4 grid grid-cols-[86px_1fr] gap-2 text-sm">
+          <dt class="text-base-content/60">Path</dt><dd class="break-all font-mono">{{.Selected.Path}}</dd>
+          <dt class="text-base-content/60">Type</dt><dd>{{if .Selected.IsDir}}Folder{{else}}File{{end}}</dd>
+          <dt class="text-base-content/60">Size</dt><dd>{{humanSize .Selected.Size .Selected.IsDir}}</dd>
+          <dt class="text-base-content/60">Mode</dt><dd class="font-mono">{{.Selected.Mode}}</dd>
+          <dt class="text-base-content/60">Modified</dt><dd>{{formatDate .Selected.ModTime}}</dd>
+        </dl>
+
+        <div class="mt-4 grid grid-cols-2 gap-2">
+          {{if not .Selected.IsDir}}<button class="btn btn-sm btn-primary" type="button" onclick="macftpd.download('{{js .Selected.Path}}')">Download</button>{{end}}
+          <button class="btn btn-sm" type="button" onclick="macftpd.renamePath('{{js .Selected.Path}}')">Rename</button>
+          <button class="btn btn-sm" type="button" onclick="macftpd.copyMove('copy', ['{{js .Selected.Path}}'])">Copy</button>
+          <button class="btn btn-sm" type="button" onclick="macftpd.copyMove('move', ['{{js .Selected.Path}}'])">Move</button>
+          <button class="btn btn-sm btn-error btn-outline col-span-2" type="button" onclick="macftpd.deletePath('{{js .Selected.Path}}')">Move to Trash</button>
+        </div>
+
+        {{if .PublicURL}}
+          <div class="mt-4 rounded-box bg-base-200 p-3 text-sm">
+            <div class="font-medium">Public URL</div>
+            <a class="mt-1 block break-all font-mono text-primary" href="{{.PublicURL}}">{{.PublicURL}}</a>
+          </div>
+        {{end}}
+
+        <div class="mt-4 rounded-box bg-base-200 p-3 text-sm">
+          <div class="flex items-center justify-between gap-2">
+            <span class="font-medium">Downloads</span>
+            <span class="badge badge-ghost">{{.SelectedStats.Downloads}}</span>
+          </div>
+          {{if notZero .SelectedStats.LastDownloadAt}}<p class="mt-1 text-xs text-base-content/60">Last {{formatDate .SelectedStats.LastDownloadAt}}</p>{{end}}
+          {{if .SelectedStats.Referrers}}
+            <div class="mt-2 text-xs">
+              {{range $ref, $count := .SelectedStats.Referrers}}<div class="break-all">{{$ref}} <span class="text-base-content/50">({{$count}})</span></div>{{end}}
+            </div>
+          {{end}}
+        </div>
+      </div>
+    {{else}}
+      <div class="py-10 text-center text-base-content/60">
+        <p class="text-base font-medium text-base-content">Select a file</p>
+        <p class="mt-1 text-sm">Details, share defaults, analytics, and file operations appear here.</p>
+      </div>
+    {{end}}
+  </aside>
+</div>

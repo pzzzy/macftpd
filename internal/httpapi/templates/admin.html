@@ -1,0 +1,90 @@
+<!doctype html>
+<html lang="en" data-theme="macftpd">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>macftpd admin</title>
+  <link rel="stylesheet" href="/assets/macftpd.css">
+  <script>
+    if (location.username || location.password) {
+      location.replace(location.protocol + "//" + location.host + location.pathname + location.search + location.hash);
+    }
+  </script>
+  <script src="/assets/htmx.min.js" defer></script>
+  <script src="/assets/app.js" defer></script>
+</head>
+<body>
+  <div class="min-h-screen">
+    <header class="sticky top-0 z-30 border-b border-base-300 bg-white/95 backdrop-blur">
+      <div class="flex min-h-16 flex-wrap items-center justify-between gap-3 px-4 py-3 lg:px-6">
+        <div>
+          <h1 class="text-xl font-semibold leading-tight">macftpd</h1>
+          <p class="text-sm text-base-content/60">Admin dashboard signed in as <span class="font-mono">{{.Username}}</span></p>
+        </div>
+        <nav class="flex flex-wrap items-center gap-2">
+          <a class="btn btn-sm btn-ghost" href="/public/">Public</a>
+          <button class="btn btn-sm btn-ghost" hx-get="/admin/partials/status" hx-target="#status-panel" hx-swap="innerHTML">Refresh Status</button>
+          <button class="btn btn-sm btn-primary" onclick="macftpd.reloadFiles()">Refresh Files</button>
+        </nav>
+      </div>
+    </header>
+
+    <main class="grid gap-4 p-4 lg:grid-cols-[minmax(0,1fr)_380px] lg:p-6">
+      <section class="min-w-0">
+        <div id="admin-notice" class="hidden"></div>
+        <div id="file-workspace"
+          class="mt-3"
+          hx-get="{{partialFilesURL .InitialPath .Selected}}"
+          hx-trigger="load"
+          hx-swap="innerHTML">
+          <div class="mac-panel rounded-box p-6">
+            <span class="loading loading-spinner loading-md"></span>
+          </div>
+        </div>
+      </section>
+
+      <aside class="grid content-start gap-4">
+        <section id="status-panel"
+          class="mac-panel rounded-box p-4"
+          hx-get="/admin/partials/status"
+          hx-trigger="load, every 5s"
+          hx-swap="innerHTML">
+          <span class="loading loading-spinner loading-sm"></span>
+        </section>
+
+        <section id="links-panel"
+          class="mac-panel rounded-box p-4"
+          hx-get="/admin/partials/links"
+          hx-trigger="load"
+          hx-swap="innerHTML">
+          <span class="loading loading-spinner loading-sm"></span>
+        </section>
+
+        <section id="activity-panel"
+          class="mac-panel rounded-box p-4"
+          hx-get="/admin/partials/activity"
+          hx-trigger="load, refresh from:body, every 4s"
+          hx-swap="innerHTML">
+          <span class="loading loading-spinner loading-sm"></span>
+        </section>
+      </aside>
+
+      <section id="users-panel"
+        class="mac-panel rounded-box p-4 lg:col-span-2"
+        hx-get="/admin/partials/users"
+        hx-trigger="load"
+        hx-swap="innerHTML">
+        <span class="loading loading-spinner loading-sm"></span>
+      </section>
+
+      <section id="retention-panel"
+        class="mac-panel rounded-box p-4 lg:col-span-2"
+        hx-get="/admin/partials/retention?kind=trash"
+        hx-trigger="load"
+        hx-swap="innerHTML">
+        <span class="loading loading-spinner loading-sm"></span>
+      </section>
+    </main>
+  </div>
+</body>
+</html>

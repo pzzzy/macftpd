@@ -8,7 +8,7 @@ Current capabilities:
 - Explicit FTPS with `AUTH TLS`, `PBSZ`, `PROT`, plus modern `MLSD`/`MLST` listings.
 - User and group permissions for list, download, upload, delete, mkdir, rename, admin, public, and dropbox workflows.
 - Storage-root containment, default macOS/security ignore rules, and virtual `public`/`dropbox` mounts for permitted users.
-- HTTP admin UI and JSON API for user management, file listing/detail/download/chunked-upload/rename/delete, copy/move, public share links, upload drop links, link revocation, live session status, trash/version restore, Cloudflare purge, and remote FTP pull into local storage.
+- HTMX + Tailwind CSS + daisyUI HTTP admin UI and JSON API for user management, file listing/detail/download/chunked-upload/rename/delete, copy/move, public share links, upload drop links, link revocation, live session status, trash/version restore, Cloudflare purge, and remote FTP pull into local storage.
 - Public HTTP file serving from the configured `public` folder with sortable directory listings, cache headers, optional Cloudflare cache tags, and download/referrer analytics.
 - Short direct share URLs (`/s/<id>/<token>/<filename>`) that serve bare files with correct MIME and `Content-Disposition` behavior; image/video/PDF/text content opens inline, archive-style content downloads.
 - Password-protected share/drop links with secure share-scoped cookies, one-download links, timed expiry, never-expiring links, and admin-visible persistent link URLs.
@@ -19,9 +19,13 @@ Current capabilities:
 ## Local Development
 
 ```bash
+npm install
+npm run build
 go test ./...
 go run ./cmd/macftpd -config configs/macftpd.example.json
 ```
+
+The generated admin/public CSS and local HTMX asset are embedded into the Go binary from `internal/httpapi/static`. Run `npm run build` after changing templates or CSS.
 
 For local-only testing, override paths and ports:
 
@@ -155,6 +159,7 @@ Before a release candidate, run:
 go test ./...
 go test -race ./...
 go vet ./...
+npm run build
 ./scripts/check-private-identifiers.sh
 go run github.com/securego/gosec/v2/cmd/gosec@latest ./...
 go run golang.org/x/vuln/cmd/govulncheck@latest ./...

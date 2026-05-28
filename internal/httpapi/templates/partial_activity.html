@@ -1,0 +1,21 @@
+<div class="flex items-center justify-between gap-3">
+  <div>
+    <p class="mac-section-title">Activity</p>
+    <h2 class="mt-1 text-lg font-semibold">Live Feed</h2>
+  </div>
+  <span class="htmx-indicator loading loading-spinner loading-xs"></span>
+</div>
+<div class="mt-3 max-h-96 space-y-2 overflow-auto mac-scroll">
+  {{range .Events}}
+    <article class="grid grid-cols-[72px_1fr_auto] gap-2 border-b border-base-200 pb-2 text-sm last:border-0">
+      <time class="font-mono text-xs text-base-content/60">{{formatTime .Time}}</time>
+      <div class="min-w-0">
+        <div class="break-words">{{.Message}}</div>
+        <div class="truncate text-xs text-base-content/60">{{.Actor}} {{.Protocol}} {{.Remote}}</div>
+      </div>
+      <span class="badge badge-sm {{statusClass .Outcome}}">{{.Outcome}}</span>
+    </article>
+  {{else}}
+    <p class="py-6 text-center text-sm text-base-content/60">No activity yet.</p>
+  {{end}}
+</div>
