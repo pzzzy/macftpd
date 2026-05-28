@@ -9,7 +9,10 @@ const RELEASE_HEADERS = {
 };
 
 function originRequestFor(request, url) {
-  const originURL = new URL(url.pathname + url.search, ORIGIN);
+  const pathname = url.pathname.startsWith("/.well-known/acme-challenge/")
+    ? `/public${url.pathname}`
+    : url.pathname;
+  const originURL = new URL(pathname + url.search, ORIGIN);
   const headers = new Headers(request.headers);
   headers.set("X-Forwarded-Host", url.host);
   headers.set("X-Forwarded-Proto", "https");
@@ -35,8 +38,9 @@ export default {
   async fetch(request, env, ctx) {
     const url = new URL(request.url);
     const originRequest = originRequestFor(request, url);
+    const isAcme = url.pathname.startsWith("/.well-known/acme-challenge/");
 
-    if ((request.method === "GET" || request.method === "HEAD") && url.pathname.startsWith("/public/")) {
+    if ((request.method === "GET" || request.method === "HEAD") && (url.pathname.startsWith("/public/") || isAcme)) {
       const cache = caches.default;
       const cached = await cache.match(request);
       if (cached) {
@@ -47,13 +51,15 @@ export default {
 
       const response = await fetch(originRequest);
       const out = new Response(response.body, response);
-      out.headers.set("Cache-Control", PUBLIC_CACHE);
-      out.headers.set("CDN-Cache-Control", PUBLIC_CACHE);
-      out.headers.set("Cloudflare-CDN-Cache-Control", PUBLIC_CACHE);
+      out.headers.set("Cache-Control", isAcme ? "no-store" : PUBLIC_CACHE);
+      if (!isAcme) {
+        out.headers.set("CDN-Cache-Control", PUBLIC_CACHE);
+        out.headers.set("Cloudflare-CDN-Cache-Control", PUBLIC_CACHE);
+      }
       out.headers.set("X-Macftpd-Cache", "MISS");
       applyReleaseHeaders(out);
 
-      if (response.status === 200) {
+      if (!isAcme && response.status === 200) {
         ctx.waitUntil(cache.put(request, out.clone()));
       }
       return out;
