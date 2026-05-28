@@ -304,6 +304,20 @@ func (s *Server) dropLink(w http.ResponseWriter, r *http.Request) {
 		http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
 		return
 	}
+	if meta.HasPassword && !strings.HasPrefix(strings.ToLower(r.Header.Get("Content-Type")), "multipart/") {
+		if err := r.ParseForm(); err != nil {
+			http.Error(w, "bad password form", http.StatusBadRequest)
+			return
+		}
+		if _, err := s.links.Verify(id, token, r.FormValue("password")); err != nil {
+			w.Header().Set("Content-Type", "text/html; charset=utf-8")
+			_ = passwordTemplate.Execute(w, map[string]any{"Title": "Protected drop"})
+			return
+		}
+		s.setShareCookie(w, r, id, token)
+		redirectSamePath(w, r)
+		return
+	}
 	r.Body = http.MaxBytesReader(w, r.Body, 20<<30)
 	// #nosec G120 -- MaxBytesReader caps the request; multipart spools file parts above maxMemory.
 	if err := r.ParseMultipartForm(32 << 20); err != nil {
@@ -322,11 +336,6 @@ func (s *Server) dropLink(w http.ResponseWriter, r *http.Request) {
 			return
 		}
 		http.Error(w, "drop link unavailable", http.StatusGone)
-		return
-	}
-	if meta.HasPassword && r.FormValue("password") != "" && r.FormValue("upload_id") == "" {
-		s.setShareCookie(w, r, id, token)
-		redirectSamePath(w, r)
 		return
 	}
 	if r.FormValue("upload_id") != "" {
@@ -374,8 +383,7 @@ func (s *Server) dropLink(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	s.logActivity(activity.Event{Type: "public_drop", Protocol: "http", Actor: "drop-link", Remote: remoteAddr(r), Action: "upload", Path: destVirtual, Bytes: n, Detail: "public drop link upload"})
-	w.Header().Set("Content-Type", "text/html; charset=utf-8")
-	_, _ = w.Write([]byte("Upload complete"))
+	writeJSON(w, http.StatusOK, dropUploadResponse(s.root, destVirtual, n, true))
 }
 
 func (s *Server) dropChunk(w http.ResponseWriter, r *http.Request, meta share.PublicLink) {
@@ -456,7 +464,7 @@ func (s *Server) dropChunk(w http.ResponseWriter, r *http.Request, meta share.Pu
 		return
 	}
 	if written < total {
-		writeJSON(w, http.StatusOK, map[string]any{"path": destVirtual, "received": written, "complete": false})
+		writeJSON(w, http.StatusOK, dropUploadResponse(s.root, destVirtual, written, false))
 		return
 	}
 	if err := part.Close(); err != nil {
@@ -484,7 +492,17 @@ func (s *Server) dropChunk(w http.ResponseWriter, r *http.Request, meta share.Pu
 		return
 	}
 	s.logActivity(activity.Event{Type: "public_drop", Protocol: "http", Actor: "drop-link", Remote: remoteAddr(r), Action: "upload", Path: destVirtual, Bytes: written, Detail: "public drop link chunked upload"})
-	writeJSON(w, http.StatusOK, map[string]any{"path": destVirtual, "received": written, "complete": true})
+	writeJSON(w, http.StatusOK, dropUploadResponse(s.root, destVirtual, written, true))
+}
+
+func dropUploadResponse(root *storage.Root, virtual string, received int64, complete bool) map[string]any {
+	body := map[string]any{"path": virtual, "received": received, "complete": complete}
+	if complete {
+		if publicURL := publicURLForShare(root, virtual); publicURL != "" {
+			body["public_url"] = publicURL
+		}
+	}
+	return body
 }
 
 func (s *Server) publicPath(urlPath string) (string, string, error) {
@@ -1357,6 +1375,8 @@ func (s *Server) sharesAPI(w http.ResponseWriter, r *http.Request, p principal) 
 				urlPath += "/" + info.Name()
 			}
 		}
+		created.Link.URLPath = urlPath
+		_ = s.links.SetURLPath(created.Link.ID, urlPath)
 		url := absoluteURL(r, urlPath)
 		s.logActivity(activity.Event{Type: "admin_share", Protocol: "http", Actor: p.User.Username, Remote: remoteAddr(r), Action: "create " + string(created.Link.Kind), Path: clean, Detail: "created public link"})
 		writeJSON(w, http.StatusOK, map[string]any{"link": created.Link, "url": url})
@@ -1792,6 +1812,20 @@ func publicURLForVirtual(root *storage.Root, virtual string) string {
 	return "/public/"
 }
 
+func publicURLForShare(root *storage.Root, virtual string) string {
+	virtual = path.Clean("/" + strings.TrimPrefix(virtual, "/"))
+	publicRoot := "/" + root.PublicDir
+	if virtual == publicRoot || !strings.HasPrefix(virtual, publicRoot+"/") {
+		return ""
+	}
+	rel := strings.TrimPrefix(virtual, publicRoot+"/")
+	parts := strings.Split(rel, "/")
+	for i, part := range parts {
+		parts[i] = url.PathEscape(part)
+	}
+	return "/public/" + strings.Join(parts, "/")
+}
+
 func errorBody(msg string) map[string]string {
 	return map[string]string{"error": msg}
 }
@@ -1828,8 +1862,8 @@ var dropTemplate = template.Must(template.New("drop").Parse(`<!doctype html>
 const form=document.getElementById('dropForm'),input=document.getElementById('dropFile'),status=document.getElementById('status');
 function uploadID(){const a=new Uint8Array(12);crypto.getRandomValues(a);return [...a].map(x=>x.toString(16).padStart(2,'0')).join('')}
 async function parse(r){let j={};try{j=await r.json()}catch{const t=await r.text().catch(()=>'');j={error:t||r.statusText}}if(!r.ok)throw new Error(j.error||r.statusText);return j}
-async function uploadOne(f,i,total){const id=uploadID(),chunkSize=16*1024*1024;let offset=0;if(f.size===0){const fd=new FormData();fd.append('filename',f.name);fd.append('upload_id',id);fd.append('offset','0');fd.append('total_size','0');fd.append('chunk',new Blob([]),f.name);await parse(await fetch(location.href,{method:'POST',body:fd}));return}while(offset<f.size){const end=Math.min(offset+chunkSize,f.size),fd=new FormData();fd.append('filename',f.name);fd.append('upload_id',id);fd.append('offset',String(offset));fd.append('total_size',String(f.size));fd.append('chunk',f.slice(offset,end),f.name);status.textContent='Uploading '+i+'/'+total+' '+f.name+' '+Math.floor((end/f.size)*100)+'%';await parse(await fetch(location.href,{method:'POST',body:fd}));offset=end}}
-async function upload(files){files=[...files];let i=0;for(const f of files){i++;await uploadOne(f,i,files.length)}status.textContent='Upload complete';input.value=''}
+async function uploadOne(f,i,total){const id=uploadID(),chunkSize=16*1024*1024;let offset=0,last=null;if(f.size===0){const fd=new FormData();fd.append('filename',f.name);fd.append('upload_id',id);fd.append('offset','0');fd.append('total_size','0');fd.append('chunk',new Blob([]),f.name);return parse(await fetch(location.href,{method:'POST',body:fd}))}while(offset<f.size){const end=Math.min(offset+chunkSize,f.size),fd=new FormData();fd.append('filename',f.name);fd.append('upload_id',id);fd.append('offset',String(offset));fd.append('total_size',String(f.size));fd.append('chunk',f.slice(offset,end),f.name);status.textContent='Uploading '+i+'/'+total+' '+f.name+' '+Math.floor((end/f.size)*100)+'%';last=await parse(await fetch(location.href,{method:'POST',body:fd}));offset=end}return last}
+async function upload(files){files=[...files];let i=0,links=[];for(const f of files){i++;const result=await uploadOne(f,i,files.length);if(result&&result.public_url)links.push('<a href="'+result.public_url+'">'+result.public_url+'</a>')}status.innerHTML=links.length?'Upload complete<br>'+links.join('<br>'):'Upload complete';input.value=''}
 form.addEventListener('submit',e=>{e.preventDefault();upload(input.files).catch(err=>status.textContent=err.message)});
 for(const ev of ['dragenter','dragover'])form.addEventListener(ev,e=>{e.preventDefault();form.classList.add('drag')});for(const ev of ['dragleave','drop'])form.addEventListener(ev,e=>{e.preventDefault();form.classList.remove('drag')});form.addEventListener('drop',e=>upload(e.dataTransfer.files).catch(err=>status.textContent=err.message));
 </script></body></html>`))
@@ -1930,8 +1964,9 @@ async function loadLiveStatus(){try{const data=await api('/api/status');const ro
 async function loadPathStats(path){try{const data=await api('/api/stats?path='+encodeURIComponent(path));const s=data.stats||{};const refs=s.referrers?Object.entries(s.referrers).sort((a,b)=>b[1]-a[1]).slice(0,4):[];const recent=(s.recent||[]).slice(0,3).map(e=>new Date(e.time).toLocaleString()+' '+(e.remote||'')).join('<br>');const box=byId('fileStats');if(box)box.innerHTML='<p><strong>Downloads</strong>: '+esc(s.downloads||0)+(s.last_download_at?' · last '+esc(new Date(s.last_download_at).toLocaleString()):'')+'</p>'+(refs.length?'<p><strong>Referrers</strong><br>'+refs.map(r=>esc(r[0])+' ('+r[1]+')').join('<br>')+'</p>':'')+(recent?'<p><strong>Recent</strong><br>'+recent+'</p>':'')}catch(e){const box=byId('fileStats');if(box)box.textContent='Stats unavailable: '+e.message}}
 async function createLink(){try{const expires=byId('linkExpires').value;const body={kind:byId('linkKind').value,path:byId('linkPath').value,expires_in:expires,password:byId('linkPassword').value,allow_overwrite:true};const data=await api('/api/shares',{method:'POST',body:JSON.stringify(body)});linkURLs[data.link.id]=data.url;byId('linksOut').innerHTML='Created <a class="link-url" href="'+attr(data.url)+'">'+esc(data.url)+'</a>';byId('linkPassword').value='';loadLinks()}catch(e){byId('linksOut').textContent=e.message}}
 async function revokeLink(id){try{if(!confirm('Revoke link '+id+'?'))return;await api('/api/shares/'+encodeURIComponent(id),{method:'DELETE'});delete linkURLs[id];byId('linksOut').textContent='Revoked '+id;loadLinks()}catch(e){byId('linksOut').textContent=e.message}}
-function linkExpiryText(l){if(l.max_downloads===1)return '1 download';if(!l.expires_at)return 'never';return new Date(l.expires_at).toLocaleString()}
-async function loadLinks(){try{const data=await api('/api/shares');const links=data.links||[];byId('linksList').innerHTML=links.map(l=>'<div class="link-item"><div><div><strong>'+esc(l.kind)+'</strong> <span class="mono">'+esc(l.path)+'</span></div><div class="activity-meta">'+esc([linkExpiryText(l),l.download_count+' downloads',l.has_password?'password':''].filter(Boolean).join(' - '))+'</div>'+(linkURLs[l.id]?'<a class="link-url" href="'+attr(linkURLs[l.id])+'">'+esc(linkURLs[l.id])+'</a>':'<div class="activity-meta">Token URL is shown when the link is created.</div>')+'</div><button data-revoke-link="'+attr(l.id)+'" class="danger">Revoke</button></div>').join('')||'<div class="muted">No active links.</div>';byId('linksList').querySelectorAll('[data-revoke-link]').forEach(b=>b.addEventListener('click',()=>revokeLink(b.dataset.revokeLink)))}catch(e){byId('linksList').innerHTML='<div class="danger-text">'+esc(e.message)+'</div>'}}
+function linkExpiryText(l){if((l.max_downloads||0)===1)return '1 download';if(!l.expires_at||String(l.expires_at).startsWith('0001-'))return 'never';return new Date(l.expires_at).toLocaleString()}
+function linkURL(l){return linkURLs[l.id]||(l.url_path?new URL(l.url_path,location.origin).toString():'')}
+async function loadLinks(){try{const data=await api('/api/shares');const links=data.links||[];byId('linksList').innerHTML=links.map(l=>{const u=linkURL(l);return '<div class="link-item"><div><div><strong>'+esc(l.kind)+'</strong> <span class="mono">'+esc(l.path)+'</span></div><div class="activity-meta">'+esc([linkExpiryText(l),(l.download_count||0)+' downloads',l.has_password?'password':''].filter(Boolean).join(' - '))+'</div>'+(u?'<a class="link-url" href="'+attr(u)+'">'+esc(u)+'</a>':'<div class="activity-meta">Legacy link URL unavailable; revoke and recreate to display it.</div>')+'</div><button data-revoke-link="'+attr(l.id)+'" class="danger">Revoke</button></div>'}).join('')||'<div class="muted">No active links.</div>';byId('linksList').querySelectorAll('[data-revoke-link]').forEach(b=>b.addEventListener('click',()=>revokeLink(b.dataset.revokeLink)))}catch(e){byId('linksList').innerHTML='<div class="danger-text">'+esc(e.message)+'</div>'}}
 async function loadRetention(kind){try{const data=await api('/api/retention?kind='+encodeURIComponent(kind));byId('retentionList').innerHTML=(data.items||[]).map(i=>'<div class="activity-item"><div class="activity-time">'+esc(kind)+'</div><div><div class="activity-msg">'+esc(i.original_path)+'</div><div class="activity-meta">'+esc([i.id,i.is_dir?'folder':sizeText(i.size,false)].join(' - '))+'</div></div><button data-restore="'+attr(i.id)+'" data-kind="'+attr(kind)+'">Restore</button></div>').join('')||'<div class="muted">Nothing retained.</div>';byId('retentionList').querySelectorAll('[data-restore]').forEach(b=>b.addEventListener('click',()=>restoreRetained(b.dataset.kind,b.dataset.restore)))}catch(e){byId('retentionList').innerHTML='<div class="danger-text">'+esc(e.message)+'</div>'}}
 async function restoreRetained(kind,id){try{const dest=prompt('Restore to path (blank for original)','');await api('/api/retention/restore',{method:'POST',body:JSON.stringify({kind,id,dest_path:dest,overwrite:false})});loadRetention(kind);loadFiles(currentPath,{replace:true})}catch(e){alert(e.message)}}
 function bindFileBrowser(){byId('goBtn').addEventListener('click',()=>goPath(byId('path').value));byId('path').addEventListener('keydown',e=>{if(e.key==='Enter')goPath(byId('path').value)});byId('upBtn').addEventListener('click',()=>goPath(parentPath(currentPath)));byId('homeBtn').addEventListener('click',()=>goPath('/'));byId('refreshBtn').addEventListener('click',()=>loadFiles(currentPath,{replace:true,selected:selectedPath}));byId('mkdirBtn').addEventListener('click',mkdir);byId('copySelectedBtn').addEventListener('click',()=>fileAction('copy'));byId('moveSelectedBtn').addEventListener('click',()=>fileAction('move'));byId('bulkDeleteBtn').addEventListener('click',bulkDelete);byId('clearSelectionBtn').addEventListener('click',()=>{selectedFiles.clear();selectedPath='';renderFiles();history.replaceState({path:currentPath,selected:''},'',stateURL(currentPath,''))});byId('fileSearch').addEventListener('input',renderFiles);byId('selectAllFiles').addEventListener('change',e=>{if(e.target.checked)visibleRows().forEach(r=>selectedFiles.add(r.path));else selectedFiles.clear();renderFiles()});document.querySelectorAll('.file-table th button[data-sort]').forEach(b=>b.addEventListener('click',()=>sortFiles(b.dataset.sort)));byId('uploadForm').addEventListener('submit',e=>{e.preventDefault();uploadFiles(byId('uploadFile').files)});byId('refreshActivityBtn').addEventListener('click',loadActivity);byId('refreshStatusBtn').addEventListener('click',loadLiveStatus);byId('createLinkBtn').addEventListener('click',createLink);byId('refreshLinksBtn').addEventListener('click',loadLinks);byId('linkKind').addEventListener('change',()=>syncLinkPath(selectedEntry()));byId('doctorBtn').addEventListener('click',doctor);byId('loadTrashBtn').addEventListener('click',()=>loadRetention('trash'));byId('loadVersionsBtn').addEventListener('click',()=>loadRetention('versions'));const dz=byId('dropzone');for(const ev of ['dragenter','dragover'])dz.addEventListener(ev,e=>{e.preventDefault();dz.classList.add('drag')});for(const ev of ['dragleave','drop'])dz.addEventListener(ev,e=>{e.preventDefault();dz.classList.remove('drag')});dz.addEventListener('drop',e=>uploadFiles(e.dataTransfer.files));window.addEventListener('popstate',()=>{selectedPath=initialSelected();loadFiles(initialPath(),{replace:false,selected:selectedPath})})}

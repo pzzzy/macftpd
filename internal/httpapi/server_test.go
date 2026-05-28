@@ -326,6 +326,68 @@ func TestDropLinkSupportsChunkedUpload(t *testing.T) {
 	}
 }
 
+func TestPasswordProtectedDropPasswordFormSetsCookie(t *testing.T) {
+	srv := testServer(t)
+	created, err := srv.links.Create(share.CreateRequest{Kind: share.KindUpload, Path: "/public", CreatedBy: "admin", Password: "correct", AllowOverwrite: true})
+	if err != nil {
+		t.Fatal(err)
+	}
+	req := httptest.NewRequest(http.MethodPost, "/d/"+created.Link.ID+"/"+created.Token, strings.NewReader("password=wrong"))
+	req.Header.Set("Content-Type", "application/x-www-form-urlencoded")
+	rr := httptest.NewRecorder()
+	srv.dropLink(rr, req)
+	if rr.Code == http.StatusBadRequest || strings.Contains(rr.Body.String(), "bad upload") {
+		t.Fatalf("password form was parsed as upload: status=%d body=%s", rr.Code, rr.Body.String())
+	}
+	if rr.Code != http.StatusOK || !strings.Contains(rr.Body.String(), "Protected drop") {
+		t.Fatalf("wrong password status=%d body=%s", rr.Code, rr.Body.String())
+	}
+
+	req = httptest.NewRequest(http.MethodPost, "/d/"+created.Link.ID+"/"+created.Token, strings.NewReader("password=correct"))
+	req.Header.Set("Content-Type", "application/x-www-form-urlencoded")
+	req.Header.Set("X-Forwarded-Proto", "https")
+	rr = httptest.NewRecorder()
+	srv.dropLink(rr, req)
+	if rr.Code != http.StatusSeeOther {
+		t.Fatalf("correct password status=%d body=%s", rr.Code, rr.Body.String())
+	}
+	if rr.Header().Get("Set-Cookie") == "" {
+		t.Fatal("password form did not set share cookie")
+	}
+}
+
+func TestSharesAPIListIncludesPersistentURLAndNeverOmittedExpiry(t *testing.T) {
+	srv := testServer(t)
+	if err := os.WriteFile(srv.root.Base+"/public/keep.txt", []byte("keep"), 0o640); err != nil {
+		t.Fatal(err)
+	}
+	req := httptest.NewRequest(http.MethodPost, "/api/shares", strings.NewReader(`{"kind":"download","path":"/public/keep.txt","expires_in":"never"}`))
+	req.SetBasicAuth("admin", "secret")
+	req.Header.Set("Content-Type", "application/json")
+	rr := httptest.NewRecorder()
+	srv.requireAdmin(srv.sharesAPI)(rr, req)
+	if rr.Code != http.StatusOK {
+		t.Fatalf("create status=%d body=%s", rr.Code, rr.Body.String())
+	}
+	req = httptest.NewRequest(http.MethodGet, "/api/shares", nil)
+	req.SetBasicAuth("admin", "secret")
+	rr = httptest.NewRecorder()
+	srv.requireAdmin(srv.sharesAPI)(rr, req)
+	if rr.Code != http.StatusOK {
+		t.Fatalf("list status=%d body=%s", rr.Code, rr.Body.String())
+	}
+	body := rr.Body.String()
+	if !strings.Contains(body, `"url_path":"/s/`) {
+		t.Fatalf("share list missing url_path: %s", body)
+	}
+	if !strings.Contains(body, `"download_count":0`) {
+		t.Fatalf("share list missing zero download_count: %s", body)
+	}
+	if strings.Contains(body, `"expires_at"`) {
+		t.Fatalf("never-expiring share exposed zero expiry: %s", body)
+	}
+}
+
 func TestUsersAPIRejectsPasswordHashMassAssignment(t *testing.T) {
 	srv := testServer(t)
 	body := strings.NewReader(`{"username":"hashonly","password_hash":"pbkdf2-sha256$1$bad$bad","home":"/hashonly","permissions":{"list":true}}`)
