@@ -7,6 +7,7 @@ import (
 	"net/http"
 	"net/http/httptest"
 	"os"
+	"strconv"
 	"strings"
 	"testing"
 
@@ -182,6 +183,61 @@ func TestUploadRejectsIgnoredDestination(t *testing.T) {
 	}
 	if _, err := os.Stat(srv.root.Base + "/public/.DS_Store"); !os.IsNotExist(err) {
 		t.Fatalf("ignored upload was written, stat err=%v", err)
+	}
+}
+
+func TestChunkedUploadAssemblesAndVersions(t *testing.T) {
+	srv := testServer(t)
+	if err := os.WriteFile(srv.root.Base+"/public/movie.mp4", []byte("old"), 0o640); err != nil {
+		t.Fatal(err)
+	}
+	chunks := []struct {
+		offset int64
+		data   string
+	}{
+		{0, "hello "},
+		{6, "world"},
+	}
+	for _, chunk := range chunks {
+		var body bytes.Buffer
+		mw := multipart.NewWriter(&body)
+		fields := map[string]string{
+			"path":       "/public",
+			"filename":   "[1997-06-28] Glastonbury.MP4",
+			"upload_id":  "upload-test-1234",
+			"offset":     strconv.FormatInt(chunk.offset, 10),
+			"total_size": "11",
+		}
+		for k, v := range fields {
+			if err := mw.WriteField(k, v); err != nil {
+				t.Fatal(err)
+			}
+		}
+		part, err := mw.CreateFormFile("chunk", "[1997-06-28] Glastonbury.MP4")
+		if err != nil {
+			t.Fatal(err)
+		}
+		if _, err := part.Write([]byte(chunk.data)); err != nil {
+			t.Fatal(err)
+		}
+		if err := mw.Close(); err != nil {
+			t.Fatal(err)
+		}
+		req := httptest.NewRequest(http.MethodPost, "/api/upload/chunk", &body)
+		req.SetBasicAuth("admin", "secret")
+		req.Header.Set("Content-Type", mw.FormDataContentType())
+		rr := httptest.NewRecorder()
+		srv.requireAdmin(srv.uploadChunk)(rr, req)
+		if rr.Code != http.StatusOK {
+			t.Fatalf("chunk offset %d status = %d body=%s", chunk.offset, rr.Code, rr.Body.String())
+		}
+	}
+	raw, err := os.ReadFile(srv.root.Base + "/public/[1997-06-28] Glastonbury.MP4")
+	if err != nil || string(raw) != "hello world" {
+		t.Fatalf("assembled payload=%q err=%v", string(raw), err)
+	}
+	if _, err := os.Stat(srv.root.Base + "/._macftpd_uploads/upload-test-1234.part"); !os.IsNotExist(err) {
+		t.Fatalf("part file was not removed, err=%v", err)
 	}
 }
 

@@ -102,6 +102,7 @@ func (s *Server) ListenAndServe(ctx context.Context) error {
 	mux.HandleFunc("/api/files/action", s.requireAdmin(s.fileAction))
 	mux.HandleFunc("/api/download", s.requireAdmin(s.download))
 	mux.HandleFunc("/api/upload", s.requireAdmin(s.upload))
+	mux.HandleFunc("/api/upload/chunk", s.requireAdmin(s.uploadChunk))
 	mux.HandleFunc("/api/fxp", s.requireAdmin(s.fxp))
 	mux.HandleFunc("/api/activity", s.requireAdmin(s.activityFeed))
 	mux.HandleFunc("/api/status", s.requireAdmin(s.statusAPI))
@@ -837,6 +838,140 @@ func (s *Server) upload(w http.ResponseWriter, r *http.Request, p principal) {
 	writeJSON(w, http.StatusOK, map[string]any{"path": filepath.ToSlash(filepath.Join(dir, filename))})
 }
 
+func (s *Server) uploadChunk(w http.ResponseWriter, r *http.Request, p principal) {
+	if r.Method != http.MethodPost {
+		writeJSON(w, http.StatusMethodNotAllowed, errorBody("method not allowed"))
+		return
+	}
+	r.Body = http.MaxBytesReader(w, r.Body, 96<<20)
+	// #nosec G120 -- MaxBytesReader caps chunk requests; multipart spools file parts above maxMemory.
+	if err := r.ParseMultipartForm(8 << 20); err != nil {
+		writeJSON(w, http.StatusBadRequest, errorBody("bad multipart form"))
+		return
+	}
+	dir := r.FormValue("path")
+	_, cleanDir, err := s.root.ResolveAdmin(dir)
+	if err != nil {
+		writeJSON(w, http.StatusBadRequest, errorBody("bad path"))
+		return
+	}
+	filename := filepath.Base(r.FormValue("filename"))
+	if filename == "" || filename == "." || filename == string(os.PathSeparator) {
+		writeJSON(w, http.StatusBadRequest, errorBody("bad filename"))
+		return
+	}
+	uploadID := r.FormValue("upload_id")
+	if !safeUploadID(uploadID) {
+		writeJSON(w, http.StatusBadRequest, errorBody("bad upload id"))
+		return
+	}
+	offset, err := strconv.ParseInt(r.FormValue("offset"), 10, 64)
+	if err != nil || offset < 0 {
+		writeJSON(w, http.StatusBadRequest, errorBody("bad offset"))
+		return
+	}
+	total, err := strconv.ParseInt(r.FormValue("total_size"), 10, 64)
+	if err != nil || total < 0 || offset > total {
+		writeJSON(w, http.StatusBadRequest, errorBody("bad total size"))
+		return
+	}
+	chunk, _, err := r.FormFile("chunk")
+	if err != nil {
+		writeJSON(w, http.StatusBadRequest, errorBody("chunk is required"))
+		return
+	}
+	defer chunk.Close()
+
+	destVirtual := path.Join(cleanDir, filename)
+	dest, _, err := s.root.ResolveAdmin(destVirtual)
+	if err != nil {
+		writeJSON(w, http.StatusBadRequest, errorBody("bad destination"))
+		return
+	}
+	tmpDir := filepath.Join(s.root.Base, "._macftpd_uploads")
+	if err := os.MkdirAll(tmpDir, 0o700); err != nil {
+		writeJSON(w, http.StatusInternalServerError, errorBody(err.Error()))
+		return
+	}
+	partPath := filepath.Join(tmpDir, uploadID+".part")
+	partPath = filepath.Clean(partPath)
+	if !strings.HasPrefix(partPath, tmpDir+string(os.PathSeparator)) {
+		writeJSON(w, http.StatusBadRequest, errorBody("bad upload id"))
+		return
+	}
+	if offset == 0 {
+		_ = os.Remove(partPath)
+	}
+	part, err := os.OpenFile(partPath, os.O_CREATE|os.O_RDWR, 0o600) // #nosec G304 -- uploadID is constrained to a safe basename above.
+	if err != nil {
+		writeJSON(w, http.StatusInternalServerError, errorBody(err.Error()))
+		return
+	}
+	defer part.Close()
+	info, err := part.Stat()
+	if err != nil {
+		writeJSON(w, http.StatusInternalServerError, errorBody(err.Error()))
+		return
+	}
+	if info.Size() != offset {
+		writeJSON(w, http.StatusConflict, errorBody(fmt.Sprintf("offset mismatch: have %d bytes", info.Size())))
+		return
+	}
+	if _, err := part.Seek(offset, io.SeekStart); err != nil {
+		writeJSON(w, http.StatusInternalServerError, errorBody(err.Error()))
+		return
+	}
+	n, err := io.Copy(part, chunk)
+	if err != nil {
+		s.logActivity(activity.Event{Type: "admin_upload", Protocol: "http", Actor: p.User.Username, Remote: remoteAddr(r), Action: "upload", Outcome: "failed", Path: destVirtual, Bytes: offset + n, Detail: err.Error()})
+		writeJSON(w, http.StatusInternalServerError, errorBody(err.Error()))
+		return
+	}
+	written := offset + n
+	if written > total {
+		writeJSON(w, http.StatusBadRequest, errorBody("chunk exceeds total size"))
+		return
+	}
+	if written < total {
+		writeJSON(w, http.StatusOK, map[string]any{"path": destVirtual, "received": written, "complete": false})
+		return
+	}
+	if err := part.Close(); err != nil {
+		writeJSON(w, http.StatusInternalServerError, errorBody(err.Error()))
+		return
+	}
+	if info, err := s.root.Stat(dest); err == nil && !info.IsDir() {
+		_, _ = s.root.Version(dest, destVirtual, p.User.Username)
+	}
+	if err := s.root.MkdirAllParent(dest, 0o750); err != nil {
+		writeJSON(w, http.StatusInternalServerError, errorBody(err.Error()))
+		return
+	}
+	if err := s.root.Rename(partPath, dest); err != nil {
+		writeJSON(w, http.StatusInternalServerError, errorBody(err.Error()))
+		return
+	}
+	if err := s.root.Chmod(dest, 0o640); err != nil {
+		writeJSON(w, http.StatusInternalServerError, errorBody(err.Error()))
+		return
+	}
+	s.logActivity(activity.Event{Type: "admin_upload", Protocol: "http", Actor: p.User.Username, Remote: remoteAddr(r), Action: "upload", Path: destVirtual, Bytes: written, Detail: "admin chunked upload"})
+	writeJSON(w, http.StatusOK, map[string]any{"path": destVirtual, "received": written, "complete": true})
+}
+
+func safeUploadID(id string) bool {
+	if len(id) < 8 || len(id) > 96 {
+		return false
+	}
+	for _, r := range id {
+		if (r >= 'a' && r <= 'z') || (r >= 'A' && r <= 'Z') || (r >= '0' && r <= '9') || r == '-' || r == '_' {
+			continue
+		}
+		return false
+	}
+	return true
+}
+
 func (s *Server) fxp(w http.ResponseWriter, r *http.Request, p principal) {
 	if r.Method != http.MethodPost {
 		writeJSON(w, http.StatusMethodNotAllowed, errorBody("method not allowed"))
@@ -1489,6 +1624,7 @@ function basename(p){const parts=cleanPath(p).split('/').filter(Boolean);return 
 function joinPath(base,name){return cleanPath((base==='/'?'':base)+'/'+name)}
 function stateURL(path,selected){const u=new URL(location.pathname+location.search+location.hash,location.origin);u.searchParams.set('path',cleanPath(path));if(selected)u.searchParams.set('selected',cleanPath(selected));else u.searchParams.delete('selected');return u.pathname+u.search+u.hash}
 function setFileStatus(msg,kind){byId('fileStatus').textContent=msg||'';byId('fileStatus').className='toast '+(kind||'')}
+async function parseJSONResponse(r){let j={};try{j=await r.json()}catch{const text=await r.text().catch(()=>'');j={error:text||r.statusText||'request failed'}}if(!r.ok)throw new Error(j.error||r.statusText);return j}
 function setHeaderStatus(msg){byId('fileHeaderStatus').textContent=msg}
 function initialPath(){return cleanPath(new URLSearchParams(location.search).get('path')||'/')}
 function initialSelected(){const p=new URLSearchParams(location.search).get('selected');return p?cleanPath(p):''}
@@ -1506,7 +1642,9 @@ async function bulkDelete(){const paths=[...selectedFiles];if(!paths.length){set
 async function fileAction(operation,paths){paths=paths&&paths.length?paths:[...selectedFiles];if(!paths.length){setFileStatus('No files selected','');return}const dest=prompt((operation==='copy'?'Copy':'Move')+' '+paths.length+' item'+(paths.length===1?'':'s')+' to folder or full path',operation==='copy'?'/public':currentPath);if(!dest)return;const overwrite=confirm('Overwrite destination if it already exists?');try{const data=await api('/api/files/action',{method:'POST',body:JSON.stringify({operation,paths,dest_path:dest,deduplicate:true,overwrite})});selectedFiles.clear();selectedPath=data.items&&data.items[0]?data.items[0].dest_path:'';setFileStatus((operation==='copy'?'Copied ':'Moved ')+paths.length+' item'+(paths.length===1?'':'s')+(data.bytes?' ('+sizeText(data.bytes,false)+')':''),'ok');await loadFiles(operation==='move'?parentPath(selectedPath||currentPath):currentPath,{replace:true,selected:selectedPath});loadActivity()}catch(e){setFileStatus(e.message,'danger-text')}}
 async function renameFile(p){try{const dest=byId('renamePath').value.trim();if(!dest)return;const data=await api('/api/files?path='+encodeURIComponent(p),{method:'PATCH',body:JSON.stringify({dest_path:dest})});selectedPath=data.entry.path;currentPath=parentPath(data.entry.path);setFileStatus('Renamed to '+data.entry.path,'ok');await loadFiles(currentPath,{push:true,selected:selectedPath})}catch(e){setFileStatus(e.message,'danger-text')}}
 async function mkdir(){const name=prompt('Folder name');if(!name)return;const p=joinPath(currentPath,name);try{await api('/api/files?path='+encodeURIComponent(p),{method:'POST',body:'{}'});setFileStatus('Created '+p,'ok');await loadFiles(currentPath,{replace:true,selected:p})}catch(e){setFileStatus(e.message,'danger-text')}}
-async function uploadFiles(files){files=[...files];if(!files.length)return;try{for(const f of files){const fd=new FormData();fd.append('path',currentPath);fd.append('file',f);const r=await fetch(apiURL('/api/upload'),{method:'POST',body:fd});const j=await r.json();if(!r.ok)throw new Error(j.error||r.statusText)}setFileStatus('Uploaded '+files.length+' file'+(files.length===1?'':'s'),'ok');byId('uploadFile').value='';await loadFiles(currentPath,{replace:true})}catch(e){setFileStatus(e.message,'danger-text')}}
+function uploadID(){const a=new Uint8Array(12);crypto.getRandomValues(a);return [...a].map(x=>x.toString(16).padStart(2,'0')).join('')}
+async function uploadOneFile(f,index,totalFiles){const chunkSize=16*1024*1024;const id=uploadID();let offset=0;let chunkIndex=0;if(f.size===0){const fd=new FormData();fd.append('path',currentPath);fd.append('filename',f.name);fd.append('upload_id',id);fd.append('offset','0');fd.append('total_size','0');fd.append('chunk',new Blob([]),f.name);const r=await fetch(apiURL('/api/upload/chunk'),{method:'POST',body:fd});await parseJSONResponse(r);return}while(offset<f.size){const end=Math.min(offset+chunkSize,f.size);const fd=new FormData();fd.append('path',currentPath);fd.append('filename',f.name);fd.append('upload_id',id);fd.append('offset',String(offset));fd.append('total_size',String(f.size));fd.append('chunk',f.slice(offset,end),f.name);setFileStatus('Uploading '+index+'/'+totalFiles+' '+f.name+' '+Math.floor((end/f.size)*100)+'%','');const r=await fetch(apiURL('/api/upload/chunk'),{method:'POST',body:fd});await parseJSONResponse(r);offset=end;chunkIndex++}}
+async function uploadFiles(files){files=[...files];if(!files.length)return;try{let i=0;for(const f of files){i++;await uploadOneFile(f,i,files.length)}setFileStatus('Uploaded '+files.length+' file'+(files.length===1?'':'s'),'ok');byId('uploadFile').value='';await loadFiles(currentPath,{replace:true})}catch(e){const msg=e&&e.message==='Load failed'?'Upload failed before reaching macftpd. Retrying as chunked upload should avoid Cloudflare request-size limits; if this persists, check your network and login session.':(e.message||String(e));setFileStatus(msg,'danger-text')}}
 async function copyText(text){try{await navigator.clipboard.writeText(text);setFileStatus('Copied '+text,'ok')}catch(e){setFileStatus(text,'')}}
 function renderActivity(){byId('activityFeed').innerHTML=activityRows.map(e=>'<div class="activity-item"><div class="activity-time">'+esc(new Date(e.time).toLocaleTimeString())+'</div><div><div class="activity-msg">'+esc(e.message||'Activity')+'</div><div class="activity-meta">'+esc([e.actor,e.protocol,e.remote].filter(Boolean).join(' - '))+'</div></div><div class="activity-pill '+attr(e.outcome||'ok')+'">'+esc(e.outcome||'ok')+'</div></div>').join('')||'<div class="muted">No activity yet.</div>'}
 async function loadActivity(){try{const data=await api('/api/activity?limit=80');activityRows=data.events||[];activityLastID=activityRows.reduce((m,e)=>Math.max(m,e.id||0),activityLastID);renderActivity()}catch(e){byId('activityFeed').innerHTML='<div class="danger-text">'+esc(e.message)+'</div>'}}
