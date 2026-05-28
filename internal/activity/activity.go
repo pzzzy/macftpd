@@ -18,6 +18,7 @@ type Event struct {
 	Protocol string    `json:"protocol,omitempty"`
 	Actor    string    `json:"actor,omitempty"`
 	Remote   string    `json:"remote,omitempty"`
+	Referrer string    `json:"referrer,omitempty"`
 	Action   string    `json:"action,omitempty"`
 	Outcome  string    `json:"outcome,omitempty"`
 	Path     string    `json:"path,omitempty"`
@@ -25,6 +26,14 @@ type Event struct {
 	Bytes    int64     `json:"bytes,omitempty"`
 	Detail   string    `json:"detail,omitempty"`
 	Message  string    `json:"message"`
+}
+
+type PathStats struct {
+	Path           string         `json:"path"`
+	Downloads      int            `json:"downloads"`
+	LastDownloadAt time.Time      `json:"last_download_at,omitempty"`
+	Referrers      map[string]int `json:"referrers,omitempty"`
+	Recent         []Event        `json:"recent,omitempty"`
 }
 
 type Store struct {
@@ -69,6 +78,7 @@ func (s *Store) Add(e Event) Event {
 	e.Protocol = strings.TrimSpace(e.Protocol)
 	e.Actor = strings.TrimSpace(e.Actor)
 	e.Remote = strings.TrimSpace(e.Remote)
+	e.Referrer = strings.TrimSpace(e.Referrer)
 	e.Action = strings.TrimSpace(e.Action)
 	e.Outcome = strings.TrimSpace(e.Outcome)
 	if e.Outcome == "" {
@@ -111,6 +121,41 @@ func (s *Store) Recent(limit int, afterID int64) []Event {
 		out = append(out, e)
 	}
 	return out
+}
+
+func (s *Store) StatsForPath(path string, limit int) PathStats {
+	stats := PathStats{Path: path, Referrers: map[string]int{}}
+	if s == nil {
+		return stats
+	}
+	if limit <= 0 || limit > 100 {
+		limit = 20
+	}
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+	for i := len(s.events) - 1; i >= 0; i-- {
+		e := s.events[i]
+		if e.Path != path || e.Outcome != "ok" || e.Action != "download" {
+			continue
+		}
+		if e.Type != "public_download" && e.Type != "share_download" {
+			continue
+		}
+		stats.Downloads++
+		if stats.LastDownloadAt.IsZero() {
+			stats.LastDownloadAt = e.Time
+		}
+		if e.Referrer != "" {
+			stats.Referrers[e.Referrer]++
+		}
+		if len(stats.Recent) < limit {
+			stats.Recent = append(stats.Recent, e)
+		}
+	}
+	if len(stats.Referrers) == 0 {
+		stats.Referrers = nil
+	}
+	return stats
 }
 
 func (s *Store) load() error {

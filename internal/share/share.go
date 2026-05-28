@@ -35,6 +35,7 @@ type Link struct {
 	ExpiresAt      time.Time `json:"expires_at,omitempty"`
 	MaxDownloads   int       `json:"max_downloads,omitempty"`
 	DownloadCount  int       `json:"download_count,omitempty"`
+	LastDownloadAt time.Time `json:"last_download_at,omitempty"`
 	TokenHash      string    `json:"token_hash"`
 	PasswordHash   string    `json:"password_hash,omitempty"`
 	AllowOverwrite bool      `json:"allow_overwrite,omitempty"`
@@ -51,6 +52,7 @@ type PublicLink struct {
 	ExpiresAt      time.Time `json:"expires_at,omitempty"`
 	MaxDownloads   int       `json:"max_downloads,omitempty"`
 	DownloadCount  int       `json:"download_count,omitempty"`
+	LastDownloadAt time.Time `json:"last_download_at,omitempty"`
 	HasPassword    bool      `json:"has_password"`
 	AllowOverwrite bool      `json:"allow_overwrite,omitempty"`
 	Disabled       bool      `json:"disabled,omitempty"`
@@ -181,7 +183,20 @@ func (s *Store) Verify(id, token, password string) (PublicLink, error) {
 	if !ok {
 		return PublicLink{}, ErrNotFound
 	}
-	if err := validate(link, token, password); err != nil {
+	if err := validate(link, token, password, false); err != nil {
+		return PublicLink{}, err
+	}
+	return public(link), nil
+}
+
+func (s *Store) VerifyAuthorized(id, token string) (PublicLink, error) {
+	s.mu.RLock()
+	link, ok := s.links[id]
+	s.mu.RUnlock()
+	if !ok {
+		return PublicLink{}, ErrNotFound
+	}
+	if err := validate(link, token, "", true); err != nil {
 		return PublicLink{}, err
 	}
 	return public(link), nil
@@ -195,11 +210,12 @@ func (s *Store) RecordDownload(id string) error {
 		return ErrNotFound
 	}
 	link.DownloadCount++
+	link.LastDownloadAt = time.Now().UTC()
 	s.links[id] = link
 	return s.saveLocked()
 }
 
-func validate(link Link, token, password string) error {
+func validate(link Link, token, password string, passwordAlreadyVerified bool) error {
 	if link.Disabled {
 		return ErrDisabled
 	}
@@ -212,7 +228,7 @@ func validate(link Link, token, password string) error {
 	if subtle.ConstantTimeCompare([]byte(hashToken(token)), []byte(link.TokenHash)) != 1 {
 		return ErrDenied
 	}
-	if link.PasswordHash != "" && !auth.VerifyPassword(link.PasswordHash, password) {
+	if link.PasswordHash != "" && !passwordAlreadyVerified && !auth.VerifyPassword(link.PasswordHash, password) {
 		return ErrDenied
 	}
 	return nil
@@ -229,6 +245,7 @@ func public(link Link) PublicLink {
 		ExpiresAt:      link.ExpiresAt,
 		MaxDownloads:   link.MaxDownloads,
 		DownloadCount:  link.DownloadCount,
+		LastDownloadAt: link.LastDownloadAt,
 		HasPassword:    link.PasswordHash != "",
 		AllowOverwrite: link.AllowOverwrite,
 		Disabled:       link.Disabled,

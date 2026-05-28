@@ -12,6 +12,7 @@ import (
 	"html/template"
 	"io"
 	"log"
+	"mime"
 	"net"
 	"net/http"
 	"net/url"
@@ -89,7 +90,9 @@ func (s *Server) ListenAndServe(ctx context.Context) error {
 	mux.HandleFunc("/public/", s.public)
 	mux.HandleFunc("/public-info/", s.publicInfo)
 	mux.HandleFunc("/share/", s.shareLink)
+	mux.HandleFunc("/s/", s.shareLink)
 	mux.HandleFunc("/drop/", s.dropLink)
+	mux.HandleFunc("/d/", s.dropLink)
 	mux.HandleFunc("/admin", s.requireAdmin(s.admin))
 	mux.HandleFunc("/admin/", s.requireAdmin(s.admin))
 	mux.HandleFunc("/api/login", s.login)
@@ -107,6 +110,7 @@ func (s *Server) ListenAndServe(ctx context.Context) error {
 	mux.HandleFunc("/api/activity", s.requireAdmin(s.activityFeed))
 	mux.HandleFunc("/api/status", s.requireAdmin(s.statusAPI))
 	mux.HandleFunc("/api/doctor", s.requireAdmin(s.doctorAPI))
+	mux.HandleFunc("/api/stats", s.requireAdmin(s.statsAPI))
 	mux.HandleFunc("/api/shares", s.requireAdmin(s.sharesAPI))
 	mux.HandleFunc("/api/shares/", s.requireAdmin(s.shareAPI))
 	mux.HandleFunc("/api/retention", s.requireAdmin(s.retentionAPI))
@@ -163,7 +167,7 @@ func (s *Server) public(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	s.setPublicCacheHeaders(w)
-	s.logActivity(activity.Event{Type: "public_download", Protocol: "http", Actor: "public", Remote: remoteAddr(r), Action: "download", Path: virtual, Detail: "public HTTP download"})
+	s.logActivity(activity.Event{Type: "public_download", Protocol: "http", Actor: "public", Remote: remoteAddr(r), Referrer: r.Referer(), Action: "download", Path: virtual, Bytes: info.Size(), Detail: "public HTTP download"})
 	s.serveStorageFile(w, r, realPath, info.Name())
 }
 
@@ -194,7 +198,11 @@ func (s *Server) publicInfo(w http.ResponseWriter, r *http.Request) {
 }
 
 func (s *Server) shareLink(w http.ResponseWriter, r *http.Request) {
-	id, token, ok := linkParts(r.URL.Path, "/share/")
+	prefix := "/share/"
+	if strings.HasPrefix(r.URL.Path, "/s/") {
+		prefix = "/s/"
+	}
+	id, token, ok := linkParts(r.URL.Path, prefix)
 	if !ok {
 		http.NotFound(w, r)
 		return
@@ -204,19 +212,29 @@ func (s *Server) shareLink(w http.ResponseWriter, r *http.Request) {
 		http.NotFound(w, r)
 		return
 	}
-	needsPassword := meta.HasPassword
 	password := ""
 	if r.Method == http.MethodPost {
 		password = r.FormValue("password")
+	} else if meta.HasPassword && s.verifyShareCookie(r, id, token) {
+		password = "__cookie__"
 	}
-	meta, err = s.links.Verify(id, token, password)
+	if meta.HasPassword && password == "__cookie__" {
+		meta, err = s.links.VerifyAuthorized(id, token)
+	} else {
+		meta, err = s.links.Verify(id, token, password)
+	}
 	if err != nil {
-		if needsPassword || errors.Is(err, share.ErrDenied) {
+		if meta.HasPassword || errors.Is(err, share.ErrDenied) {
 			w.Header().Set("Content-Type", "text/html; charset=utf-8")
 			_ = passwordTemplate.Execute(w, map[string]any{"Title": "Protected share"})
 			return
 		}
 		http.Error(w, "share unavailable", http.StatusGone)
+		return
+	}
+	if meta.HasPassword && r.Method == http.MethodPost {
+		s.setShareCookie(w, r, id, token)
+		redirectSamePath(w, r)
 		return
 	}
 	realPath, clean, err := s.root.ResolveAdmin(meta.Path)
@@ -229,9 +247,10 @@ func (s *Server) shareLink(w http.ResponseWriter, r *http.Request) {
 		http.NotFound(w, r)
 		return
 	}
-	if r.URL.Query().Get("download") == "1" && !info.IsDir() {
+	if !info.IsDir() {
 		_ = s.links.RecordDownload(id)
-		w.Header().Set("Content-Disposition", fmt.Sprintf("attachment; filename=%q", info.Name()))
+		s.logActivity(activity.Event{Type: "share_download", Protocol: "http", Actor: "share-link", Remote: remoteAddr(r), Referrer: r.Referer(), Action: "download", Path: clean, Bytes: info.Size(), Detail: "public share download"})
+		setFileDisposition(w, r, info.Name())
 		s.serveStorageFile(w, r, realPath, info.Name())
 		return
 	}
@@ -248,19 +267,37 @@ func (s *Server) shareLink(w http.ResponseWriter, r *http.Request) {
 }
 
 func (s *Server) dropLink(w http.ResponseWriter, r *http.Request) {
-	id, token, ok := linkParts(r.URL.Path, "/drop/")
+	prefix := "/drop/"
+	if strings.HasPrefix(r.URL.Path, "/d/") {
+		prefix = "/d/"
+	}
+	id, token, ok := linkParts(r.URL.Path, prefix)
 	if !ok {
 		http.NotFound(w, r)
 		return
 	}
-	meta, err := s.links.Verify(id, token, r.FormValue("password"))
+	meta, err := s.links.Public(id)
 	if err != nil || meta.Kind != share.KindUpload {
 		http.Error(w, "drop link unavailable", http.StatusGone)
 		return
 	}
 	if r.Method == http.MethodGet {
+		if meta.HasPassword && !s.verifyShareCookie(r, id, token) {
+			w.Header().Set("Content-Type", "text/html; charset=utf-8")
+			_ = passwordTemplate.Execute(w, map[string]any{"Title": "Protected drop"})
+			return
+		}
+		if meta.HasPassword {
+			meta, err = s.links.VerifyAuthorized(id, token)
+		} else {
+			meta, err = s.links.Verify(id, token, "")
+		}
+		if err != nil {
+			http.Error(w, "drop link unavailable", http.StatusGone)
+			return
+		}
 		w.Header().Set("Content-Type", "text/html; charset=utf-8")
-		_ = dropTemplate.Execute(w, meta)
+		_ = dropTemplate.Execute(w, map[string]any{"Path": meta.Path, "HasPassword": meta.HasPassword})
 		return
 	}
 	if r.Method != http.MethodPost {
@@ -273,6 +310,29 @@ func (s *Server) dropLink(w http.ResponseWriter, r *http.Request) {
 		http.Error(w, "bad upload", http.StatusBadRequest)
 		return
 	}
+	if meta.HasPassword && s.verifyShareCookie(r, id, token) {
+		meta, err = s.links.VerifyAuthorized(id, token)
+	} else {
+		meta, err = s.links.Verify(id, token, r.FormValue("password"))
+	}
+	if err != nil || meta.Kind != share.KindUpload {
+		if meta.HasPassword && r.FormValue("password") != "" && r.FormValue("upload_id") == "" {
+			w.Header().Set("Content-Type", "text/html; charset=utf-8")
+			_ = passwordTemplate.Execute(w, map[string]any{"Title": "Protected drop"})
+			return
+		}
+		http.Error(w, "drop link unavailable", http.StatusGone)
+		return
+	}
+	if meta.HasPassword && r.FormValue("password") != "" && r.FormValue("upload_id") == "" {
+		s.setShareCookie(w, r, id, token)
+		redirectSamePath(w, r)
+		return
+	}
+	if r.FormValue("upload_id") != "" {
+		s.dropChunk(w, r, meta)
+		return
+	}
 	file, header, err := r.FormFile("file")
 	if err != nil {
 		http.Error(w, "file is required", http.StatusBadRequest)
@@ -280,6 +340,10 @@ func (s *Server) dropLink(w http.ResponseWriter, r *http.Request) {
 	}
 	defer file.Close()
 	name := filepath.Base(header.Filename)
+	if name == "" || name == "." || name == string(os.PathSeparator) {
+		http.Error(w, "bad filename", http.StatusBadRequest)
+		return
+	}
 	destVirtual := path.Join(meta.Path, name)
 	dest, _, err := s.root.ResolveAdmin(destVirtual)
 	if err != nil {
@@ -312,6 +376,115 @@ func (s *Server) dropLink(w http.ResponseWriter, r *http.Request) {
 	s.logActivity(activity.Event{Type: "public_drop", Protocol: "http", Actor: "drop-link", Remote: remoteAddr(r), Action: "upload", Path: destVirtual, Bytes: n, Detail: "public drop link upload"})
 	w.Header().Set("Content-Type", "text/html; charset=utf-8")
 	_, _ = w.Write([]byte("Upload complete"))
+}
+
+func (s *Server) dropChunk(w http.ResponseWriter, r *http.Request, meta share.PublicLink) {
+	filename := filepath.Base(r.FormValue("filename"))
+	if filename == "" || filename == "." || filename == string(os.PathSeparator) {
+		writeJSON(w, http.StatusBadRequest, errorBody("bad filename"))
+		return
+	}
+	uploadID := r.FormValue("upload_id")
+	if !safeUploadID(uploadID) {
+		writeJSON(w, http.StatusBadRequest, errorBody("bad upload id"))
+		return
+	}
+	offset, err := strconv.ParseInt(r.FormValue("offset"), 10, 64)
+	if err != nil || offset < 0 {
+		writeJSON(w, http.StatusBadRequest, errorBody("bad offset"))
+		return
+	}
+	total, err := strconv.ParseInt(r.FormValue("total_size"), 10, 64)
+	if err != nil || total < 0 || offset > total {
+		writeJSON(w, http.StatusBadRequest, errorBody("bad total size"))
+		return
+	}
+	chunk, _, err := r.FormFile("chunk")
+	if err != nil {
+		writeJSON(w, http.StatusBadRequest, errorBody("chunk is required"))
+		return
+	}
+	defer chunk.Close()
+	destVirtual := path.Join(meta.Path, filename)
+	dest, _, err := s.root.ResolveAdmin(destVirtual)
+	if err != nil {
+		writeJSON(w, http.StatusBadRequest, errorBody("bad destination"))
+		return
+	}
+	tmpDir := filepath.Join(s.root.Base, "._macftpd_uploads")
+	if err := os.MkdirAll(tmpDir, 0o700); err != nil {
+		writeJSON(w, http.StatusInternalServerError, errorBody(err.Error()))
+		return
+	}
+	partPath := filepath.Join(tmpDir, "drop-"+uploadID+".part")
+	partPath = filepath.Clean(partPath)
+	if !strings.HasPrefix(partPath, tmpDir+string(os.PathSeparator)) {
+		writeJSON(w, http.StatusBadRequest, errorBody("bad upload id"))
+		return
+	}
+	if offset == 0 {
+		_ = os.Remove(partPath)
+	}
+	part, err := os.OpenFile(partPath, os.O_CREATE|os.O_RDWR, 0o600) // #nosec G304 -- uploadID is constrained to a safe basename above.
+	if err != nil {
+		writeJSON(w, http.StatusInternalServerError, errorBody(err.Error()))
+		return
+	}
+	defer part.Close()
+	info, err := part.Stat()
+	if err != nil {
+		writeJSON(w, http.StatusInternalServerError, errorBody(err.Error()))
+		return
+	}
+	if info.Size() != offset {
+		writeJSON(w, http.StatusConflict, errorBody(fmt.Sprintf("offset mismatch: have %d bytes", info.Size())))
+		return
+	}
+	if _, err := part.Seek(offset, io.SeekStart); err != nil {
+		writeJSON(w, http.StatusInternalServerError, errorBody(err.Error()))
+		return
+	}
+	n, err := io.Copy(part, chunk)
+	if err != nil {
+		s.logActivity(activity.Event{Type: "public_drop", Protocol: "http", Actor: "drop-link", Remote: remoteAddr(r), Action: "upload", Outcome: "failed", Path: destVirtual, Bytes: offset + n, Detail: err.Error()})
+		writeJSON(w, http.StatusInternalServerError, errorBody(err.Error()))
+		return
+	}
+	written := offset + n
+	if written > total {
+		writeJSON(w, http.StatusBadRequest, errorBody("chunk exceeds total size"))
+		return
+	}
+	if written < total {
+		writeJSON(w, http.StatusOK, map[string]any{"path": destVirtual, "received": written, "complete": false})
+		return
+	}
+	if err := part.Close(); err != nil {
+		writeJSON(w, http.StatusInternalServerError, errorBody(err.Error()))
+		return
+	}
+	if !meta.AllowOverwrite {
+		if _, err := s.root.Stat(dest); err == nil {
+			writeJSON(w, http.StatusConflict, errorBody("destination exists"))
+			return
+		}
+	} else if info, err := s.root.Stat(dest); err == nil && !info.IsDir() {
+		_, _ = s.root.Version(dest, destVirtual, "drop-link")
+	}
+	if err := s.root.MkdirAllParent(dest, 0o750); err != nil {
+		writeJSON(w, http.StatusInternalServerError, errorBody(err.Error()))
+		return
+	}
+	if err := s.root.Rename(partPath, dest); err != nil {
+		writeJSON(w, http.StatusInternalServerError, errorBody(err.Error()))
+		return
+	}
+	if err := s.root.Chmod(dest, 0o640); err != nil {
+		writeJSON(w, http.StatusInternalServerError, errorBody(err.Error()))
+		return
+	}
+	s.logActivity(activity.Event{Type: "public_drop", Protocol: "http", Actor: "drop-link", Remote: remoteAddr(r), Action: "upload", Path: destVirtual, Bytes: written, Detail: "public drop link chunked upload"})
+	writeJSON(w, http.StatusOK, map[string]any{"path": destVirtual, "received": written, "complete": true})
 }
 
 func (s *Server) publicPath(urlPath string) (string, string, error) {
@@ -1159,7 +1332,9 @@ func (s *Server) sharesAPI(w http.ResponseWriter, r *http.Request, p principal) 
 			return
 		}
 		var expires time.Time
-		if req.ExpiresIn != "" {
+		if req.ExpiresIn == "1download" {
+			req.MaxDownloads = 1
+		} else if req.ExpiresIn != "" && req.ExpiresIn != "never" {
 			d, err := time.ParseDuration(req.ExpiresIn)
 			if err != nil {
 				writeJSON(w, http.StatusBadRequest, errorBody("bad expires_in duration"))
@@ -1172,16 +1347,35 @@ func (s *Server) sharesAPI(w http.ResponseWriter, r *http.Request, p principal) 
 			writeJSON(w, http.StatusBadRequest, errorBody(err.Error()))
 			return
 		}
-		prefix := "/share/"
+		prefix := "/s/"
 		if created.Link.Kind == share.KindUpload {
-			prefix = "/drop/"
+			prefix = "/d/"
 		}
-		url := absoluteURL(r, prefix+created.Link.ID+"/"+created.Token)
+		urlPath := prefix + created.Link.ID + "/" + created.Token
+		if created.Link.Kind == share.KindDownload {
+			if info, err := s.root.Stat(realPath); err == nil && !info.IsDir() {
+				urlPath += "/" + info.Name()
+			}
+		}
+		url := absoluteURL(r, urlPath)
 		s.logActivity(activity.Event{Type: "admin_share", Protocol: "http", Actor: p.User.Username, Remote: remoteAddr(r), Action: "create " + string(created.Link.Kind), Path: clean, Detail: "created public link"})
 		writeJSON(w, http.StatusOK, map[string]any{"link": created.Link, "url": url})
 	default:
 		writeJSON(w, http.StatusMethodNotAllowed, errorBody("method not allowed"))
 	}
+}
+
+func (s *Server) statsAPI(w http.ResponseWriter, r *http.Request, _ principal) {
+	if r.Method != http.MethodGet {
+		writeJSON(w, http.StatusMethodNotAllowed, errorBody("method not allowed"))
+		return
+	}
+	_, clean, err := s.root.ResolveAdmin(r.URL.Query().Get("path"))
+	if err != nil {
+		writeJSON(w, http.StatusBadRequest, errorBody("bad path"))
+		return
+	}
+	writeJSON(w, http.StatusOK, map[string]any{"stats": s.activity.StatsForPath(clean, 20)})
 }
 
 func (s *Server) shareAPI(w http.ResponseWriter, r *http.Request, p principal) {
@@ -1483,11 +1677,83 @@ func remoteAddr(r *http.Request) string {
 	return host
 }
 
+func setFileDisposition(w http.ResponseWriter, r *http.Request, name string) {
+	ctype := mime.TypeByExtension(strings.ToLower(filepath.Ext(name)))
+	inline := strings.HasPrefix(ctype, "image/") || strings.HasPrefix(ctype, "video/") || strings.HasPrefix(ctype, "audio/") || ctype == "application/pdf" || strings.HasPrefix(ctype, "text/")
+	if r.URL.Query().Get("download") == "1" {
+		inline = false
+	}
+	disposition := "attachment"
+	if inline {
+		disposition = "inline"
+	}
+	w.Header().Set("Content-Disposition", dispositionHeader(disposition, name))
+}
+
+func dispositionHeader(disposition, name string) string {
+	fallback := strings.Map(func(r rune) rune {
+		if r < 0x20 || r == 0x7f || r == '"' || r == '\\' || r > 0x7e {
+			return '_'
+		}
+		return r
+	}, name)
+	if fallback == "" {
+		fallback = "download"
+	}
+	return fmt.Sprintf("%s; filename=%q; filename*=UTF-8''%s", disposition, fallback, url.PathEscape(name))
+}
+
 func requestIsHTTPS(r *http.Request) bool {
 	if r.TLS != nil {
 		return true
 	}
 	return strings.EqualFold(r.Header.Get("X-Forwarded-Proto"), "https") || strings.EqualFold(r.Header.Get("CF-Visitor"), `{"scheme":"https"}`)
+}
+
+func (s *Server) setShareCookie(w http.ResponseWriter, r *http.Request, id, token string) {
+	exp := time.Now().Add(12 * time.Hour).Unix()
+	payload := fmt.Sprintf("%s|%d", id, exp)
+	mac := hmac.New(sha256.New, s.sessionKey)
+	_, _ = mac.Write([]byte(payload + "|" + token))
+	value := payload + "|" + base64.RawURLEncoding.EncodeToString(mac.Sum(nil))
+	cookiePath := r.URL.EscapedPath()
+	if cookiePath == "" {
+		cookiePath = "/"
+	}
+	http.SetCookie(w, &http.Cookie{Name: shareCookieName(id), Value: base64.RawURLEncoding.EncodeToString([]byte(value)), Path: cookiePath, Expires: time.Unix(exp, 0), HttpOnly: true, Secure: true, SameSite: http.SameSiteLaxMode})
+}
+
+func (s *Server) verifyShareCookie(r *http.Request, id, token string) bool {
+	cookie, err := r.Cookie(shareCookieName(id))
+	if err != nil {
+		return false
+	}
+	decoded, err := base64.RawURLEncoding.DecodeString(cookie.Value)
+	if err != nil {
+		return false
+	}
+	parts := strings.Split(string(decoded), "|")
+	if len(parts) != 3 || parts[0] != id {
+		return false
+	}
+	var unix int64
+	if _, err := fmt.Sscanf(parts[1], "%d", &unix); err != nil || time.Now().After(time.Unix(unix, 0)) {
+		return false
+	}
+	payload := strings.Join(parts[:2], "|")
+	mac := hmac.New(sha256.New, s.sessionKey)
+	_, _ = mac.Write([]byte(payload + "|" + token))
+	expected := base64.RawURLEncoding.EncodeToString(mac.Sum(nil))
+	return hmac.Equal([]byte(expected), []byte(parts[2]))
+}
+
+func shareCookieName(id string) string {
+	return "macftpd_share_" + strings.NewReplacer("-", "_").Replace(id)
+}
+
+func redirectSamePath(w http.ResponseWriter, r *http.Request) {
+	w.Header().Set("Location", (&url.URL{Path: r.URL.Path}).String())
+	w.WriteHeader(http.StatusSeeOther)
 }
 
 func linkParts(urlPath, prefix string) (string, string, bool) {
@@ -1557,8 +1823,16 @@ var passwordTemplate = template.Must(template.New("sharePassword").Parse(`<!doct
 <body><main><h1>{{.Title}}</h1><form method="post"><input type="password" name="password" autocomplete="current-password" placeholder="Password"><button>Open</button></form></main></body></html>`))
 
 var dropTemplate = template.Must(template.New("drop").Parse(`<!doctype html>
-<html lang="en"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width, initial-scale=1"><title>Upload drop</title><style>body{font-family:-apple-system,BlinkMacSystemFont,"Segoe UI",sans-serif;background:#f6f7f4;margin:0}main{max-width:520px;margin:10vh auto;background:#fff;border:1px solid #d9dfdb;border-radius:8px;padding:22px}input,button{font:inherit;padding:10px;width:100%;box-sizing:border-box}button{margin-top:10px;background:#17645b;color:#fff;border:0;border-radius:6px}.mono{font-family:ui-monospace,Menlo,monospace}</style></head>
-<body><main><h1>Upload Drop</h1><p class="mono">{{.Path}}</p><form method="post" enctype="multipart/form-data"><input type="file" name="file" required><button>Upload</button></form></main></body></html>`))
+<html lang="en"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width, initial-scale=1"><title>Upload drop</title><style>:root{font-family:-apple-system,BlinkMacSystemFont,"Segoe UI",sans-serif;background:#f6f7f4;color:#151716}body{margin:0}main{max-width:520px;margin:10vh auto;background:#fff;border:1px solid #d9dfdb;border-radius:8px;padding:22px}input,button{font:inherit;padding:10px;width:100%;box-sizing:border-box}button{margin-top:10px;background:#17645b;color:#fff;border:0;border-radius:6px}.mono{font-family:ui-monospace,Menlo,monospace;word-break:break-all}.status{min-height:22px;margin-top:10px;color:#4f5b55}.drop{border:1px dashed #9aa59e;border-radius:8px;padding:16px;background:#fafbf9}.drop.drag{border-color:#17645b;background:#edf7f4}@media (prefers-color-scheme:dark){:root{background:#151716;color:#eef1ed}main{background:#1f2320;border-color:#3b423d}.drop{background:#1a1e1b}}</style></head>
+<body><main><h1>Upload Drop</h1><p class="mono">{{.Path}}</p><form id="dropForm" class="drop" method="post" enctype="multipart/form-data"><input id="dropFile" type="file" name="file" multiple required><button>Upload</button></form><div id="status" class="status"></div></main><script>
+const form=document.getElementById('dropForm'),input=document.getElementById('dropFile'),status=document.getElementById('status');
+function uploadID(){const a=new Uint8Array(12);crypto.getRandomValues(a);return [...a].map(x=>x.toString(16).padStart(2,'0')).join('')}
+async function parse(r){let j={};try{j=await r.json()}catch{const t=await r.text().catch(()=>'');j={error:t||r.statusText}}if(!r.ok)throw new Error(j.error||r.statusText);return j}
+async function uploadOne(f,i,total){const id=uploadID(),chunkSize=16*1024*1024;let offset=0;if(f.size===0){const fd=new FormData();fd.append('filename',f.name);fd.append('upload_id',id);fd.append('offset','0');fd.append('total_size','0');fd.append('chunk',new Blob([]),f.name);await parse(await fetch(location.href,{method:'POST',body:fd}));return}while(offset<f.size){const end=Math.min(offset+chunkSize,f.size),fd=new FormData();fd.append('filename',f.name);fd.append('upload_id',id);fd.append('offset',String(offset));fd.append('total_size',String(f.size));fd.append('chunk',f.slice(offset,end),f.name);status.textContent='Uploading '+i+'/'+total+' '+f.name+' '+Math.floor((end/f.size)*100)+'%';await parse(await fetch(location.href,{method:'POST',body:fd}));offset=end}}
+async function upload(files){files=[...files];let i=0;for(const f of files){i++;await uploadOne(f,i,files.length)}status.textContent='Upload complete';input.value=''}
+form.addEventListener('submit',e=>{e.preventDefault();upload(input.files).catch(err=>status.textContent=err.message)});
+for(const ev of ['dragenter','dragover'])form.addEventListener(ev,e=>{e.preventDefault();form.classList.add('drag')});for(const ev of ['dragleave','drop'])form.addEventListener(ev,e=>{e.preventDefault();form.classList.remove('drag')});form.addEventListener('drop',e=>upload(e.dataTransfer.files).catch(err=>status.textContent=err.message));
+</script></body></html>`))
 
 var adminTemplate = template.Must(template.New("admin").Parse(`<!doctype html>
 <html lang="en">
@@ -1577,6 +1851,7 @@ table{width:100%;border-collapse:collapse}th,td{text-align:left;border-bottom:1p
 .file-shell{display:grid;grid-template-columns:minmax(0,1fr) 330px;gap:14px}.file-top{display:grid;grid-template-columns:auto auto minmax(180px,1fr) auto;gap:8px;align-items:center;margin-bottom:10px}.file-path-wrap{position:relative}.file-path-wrap input{padding-left:34px}.file-path-wrap span{position:absolute;left:10px;top:8px;color:var(--muted)}.crumbs{display:flex;flex-wrap:wrap;gap:6px;margin:0 0 10px}.crumbs button{padding:5px 8px}.file-tools{display:grid;grid-template-columns:minmax(180px,1fr) auto auto auto auto;gap:8px;align-items:center;margin-bottom:10px}.file-summary{font-size:12px;color:var(--muted);margin:2px 0 10px}.file-list-wrap{border:1px solid var(--line);border-radius:8px;overflow:auto;min-height:360px}.file-table th{position:sticky;top:0;background:var(--soft);z-index:1}.file-table tr{height:42px}.file-table tbody tr{cursor:pointer}.file-table tbody tr:hover{background:#f8faf8}.file-table tbody tr.selected{background:#e8f2ef}.file-table td{vertical-align:middle}.file-name{display:flex;gap:8px;align-items:center;min-width:0}.file-name strong{overflow:hidden;text-overflow:ellipsis;white-space:nowrap}.file-icon{display:inline-flex;width:24px;height:24px;align-items:center;justify-content:center;border-radius:5px;background:#e8eeeb;color:#40504a;font-size:13px}.file-check{width:34px}.empty-state{padding:36px 20px;text-align:center;color:var(--muted)}
 .file-card{border:1px solid var(--line);border-radius:8px;padding:14px;min-height:360px}.file-card h2{font-size:16px}.file-card dl{display:grid;grid-template-columns:86px 1fr;gap:7px 12px;margin:0 0 14px}.file-card dt{color:var(--muted)}.file-card dd{margin:0;word-break:break-word}.inspector-actions{display:grid;grid-template-columns:1fr 1fr;gap:8px}.inspector-actions .wide-action{grid-column:1/-1}.dropzone{border:1px dashed #9aa59e;border-radius:8px;padding:12px;margin-top:12px;background:#fafbf9}.dropzone.drag{border-color:var(--accent);background:#edf7f4}.dropzone label{margin-top:0}.toast{min-height:20px;font-size:13px;margin-top:10px}.sort-mark{color:var(--accent);font-weight:700}
 .activity-feed{display:grid;gap:8px;max-height:360px;overflow:auto}.activity-item{display:grid;grid-template-columns:118px 1fr auto;gap:10px;align-items:start;border-bottom:1px solid var(--line2);padding:8px 0}.activity-item:last-child{border-bottom:0}.activity-time,.activity-meta{font-size:12px;color:var(--muted)}.activity-msg{font-size:13px}.activity-pill{font-size:11px;border:1px solid var(--line);border-radius:999px;padding:2px 7px;color:var(--muted)}.activity-pill.failed,.activity-pill.denied,.activity-pill.limited{color:var(--danger);border-color:#c8a5a5}.activity-pill.ok{color:var(--ok);border-color:#9fc9ae}
+.links-list{display:grid;gap:8px;max-height:360px;overflow:auto}.link-item{display:grid;grid-template-columns:1fr auto;gap:8px;border-bottom:1px solid var(--line2);padding:8px 0}.link-url{word-break:break-all}.stats-list{font-size:12px;color:var(--muted);line-height:1.45}.stats-list strong{color:inherit}
 @media (max-width:980px){main{grid-template-columns:1fr}.file-shell{grid-template-columns:1fr}.file-card{min-height:0}.file-top,.file-tools{grid-template-columns:1fr 1fr}.file-top .file-path-wrap,.file-tools input{grid-column:1/-1}}
 @media (max-width:640px){header{height:auto;align-items:flex-start;gap:8px;flex-direction:column;padding:12px 16px}main{padding:14px}.row{flex-direction:column;align-items:stretch}.file-table th:nth-child(4),.file-table td:nth-child(4),.file-table th:nth-child(5),.file-table td:nth-child(5){display:none}.file-tools{grid-template-columns:1fr 1fr}.file-tools input{grid-column:1/-1}.inspector-actions{grid-template-columns:1fr}}
 @media (prefers-color-scheme:dark){:root{background:#151716;color:#eef1ed;--panel:#1f2320;--line:#3b423d;--line2:#333a35;--muted:#a8b1ab;--soft:#2a302c;--accent:#7bd8ca}input{background:#151716;border-color:#48514b}button{color:#eef1ed;border-color:#59645d}.file-table tbody tr:hover{background:#252b27}.file-table tbody tr.selected{background:#1f3a35}.file-icon{background:#303832;color:#d6ded9}.dropzone{background:#1a1e1b}.dropzone.drag{background:#17312d}}
@@ -1598,13 +1873,13 @@ table{width:100%;border-collapse:collapse}th,td{text-align:left;border-bottom:1p
 <section class="panel"><h2>Users</h2><table><thead><tr><th>User</th><th>Home</th><th>Groups</th><th>Disabled</th><th></th></tr></thead><tbody id="users"></tbody></table></section>
 <section class="panel wide"><div class="toolbar"><h2>Files</h2><div class="muted" id="fileHeaderStatus">Ready</div></div><div class="file-top"><button class="icon" id="upBtn" title="Up one folder">Up</button><button class="icon" id="homeBtn" title="Storage root">/</button><div class="file-path-wrap"><span>/</span><input id="path" value="/" spellcheck="false"></div><button class="primary" id="goBtn">Go</button></div><div class="crumbs" id="crumbs"></div><div class="file-shell"><div><div class="file-tools"><input id="fileSearch" placeholder="Filter files"><button id="refreshBtn">Refresh</button><button id="mkdirBtn">New folder</button><button id="copySelectedBtn">Copy selected</button><button id="moveSelectedBtn">Move selected</button><button id="bulkDeleteBtn">Delete selected</button><button id="clearSelectionBtn">Clear</button></div><div class="file-summary" id="fileSummary"></div><div class="file-list-wrap"><table class="file-table"><thead><tr><th class="file-check"><input id="selectAllFiles" type="checkbox" title="Select all"></th><th><button data-sort="name">Name <span id="sort-name" class="sort-mark"></span></button></th><th class="right"><button data-sort="size">Size <span id="sort-size" class="sort-mark"></span></button></th><th><button data-sort="mod_time">Modified <span id="sort-mod_time" class="sort-mark"></span></button></th><th>Actions</th></tr></thead><tbody id="files"><tr><td colspan="5" class="empty-state">Loading...</td></tr></tbody></table></div><div id="dropzone" class="dropzone"><form id="uploadForm" enctype="multipart/form-data"><label>Upload to current folder</label><div class="row"><input id="uploadFile" type="file" multiple><button>Upload</button></div></form></div><div id="fileStatus" class="toast"></div></div><aside id="fileInfo" class="file-card"></aside></div></section>
 <section class="panel"><h2>Cloudflare / Doctor</h2><div class="row"><button onclick="purge()">Purge public cache</button><button id="doctorBtn">Run doctor</button></div><pre id="cf"></pre></section>
-<section class="panel"><h2>Links</h2><div class="row"><select id="linkKind"><option value="download">Share</option><option value="upload">Drop</option></select><input id="linkPath" value="/public"></div><div class="row"><input id="linkExpires" placeholder="Expiry e.g. 24h"><input id="linkPassword" type="password" placeholder="Password optional"></div><p><button id="createLinkBtn">Create link</button></p><pre id="linksOut"></pre></section>
+<section class="panel"><div class="toolbar"><h2>Links</h2><button id="refreshLinksBtn">Refresh</button></div><div class="row"><select id="linkKind"><option value="download">Share selected</option><option value="upload">Drop into folder</option></select><input id="linkPath" value="/public"></div><div class="row"><select id="linkExpires"><option value="1download">1 download</option><option value="1h">1h</option><option value="12h">12h</option><option value="24h" selected>24h</option><option value="168h">1w</option><option value="720h">1m</option><option value="never">Never</option></select><input id="linkPassword" type="password" placeholder="Password optional"></div><p><button id="createLinkBtn">Create link</button></p><div id="linksOut" class="toast"></div><div id="linksList" class="links-list"></div></section>
 <section class="panel"><h2>Trash / versions</h2><div class="row"><button id="loadTrashBtn">Trash</button><button id="loadVersionsBtn">Versions</button></div><div id="retentionList" class="activity-feed"></div></section>
 <section class="panel wide"><div class="toolbar"><h2>Live status</h2><button id="refreshStatusBtn">Refresh</button></div><div id="liveStatus" class="activity-feed"></div></section>
 <section class="panel wide"><div class="toolbar"><h2>Activity</h2><button id="refreshActivityBtn">Refresh</button></div><div id="activityFeed" class="activity-feed"><div class="muted">Loading activity...</div></div></section>
 </main>
 <script>
-let fileRows=[];let fileSort='name';let fileSortDir=1;let fileDir={};let currentPath='/';let selectedPath='';let selectedFiles=new Set();let loadingFiles=false;let activityLastID=0;let activityRows=[];
+let fileRows=[];let fileSort='name';let fileSortDir=1;let fileDir={};let currentPath='/';let selectedPath='';let selectedFiles=new Set();let loadingFiles=false;let activityLastID=0;let activityRows=[];let linkURLs={};
 function apiURL(path){return new URL(path, location.origin).toString()}
 async function api(path, options={}){const r=await fetch(apiURL(path),{headers:{'content-type':'application/json'},...options});const j=await r.json();if(!r.ok)throw new Error(j.error||r.statusText);return j}
 async function loginFromURLCredentials(){if(!location.username||location.protocol!=='https:')return;const username=decodeURIComponent(location.username);const password=decodeURIComponent(location.password);history.replaceState(null,'',location.pathname+location.search+location.hash);const r=await fetch(apiURL('/api/login'),{method:'POST',headers:{'content-type':'application/json'},body:JSON.stringify({username,password})});if(!r.ok){let msg='login failed';try{msg=(await r.json()).error||msg}catch{}throw new Error(msg)}}
@@ -1628,9 +1903,11 @@ async function parseJSONResponse(r){let j={};try{j=await r.json()}catch{const te
 function setHeaderStatus(msg){byId('fileHeaderStatus').textContent=msg}
 function initialPath(){return cleanPath(new URLSearchParams(location.search).get('path')||'/')}
 function initialSelected(){const p=new URLSearchParams(location.search).get('selected');return p?cleanPath(p):''}
+function selectedEntry(){return fileRows.find(x=>x.path===selectedPath)}
+function syncLinkPath(e){const kind=byId('linkKind')?byId('linkKind').value:'download';if(!byId('linkPath'))return;if(kind==='upload'){byId('linkPath').value=e&&e.is_dir?e.path:currentPath}else{byId('linkPath').value=e?e.path:(selectedPath||currentPath)}}
 async function loadFiles(path=currentPath,opts={}){path=cleanPath(path);currentPath=path;byId('path').value=path;loadingFiles=true;setHeaderStatus('Loading '+path);if(opts.push)history.pushState({path,selected:opts.selected||''},'',stateURL(path,opts.selected||''));else if(opts.replace)history.replaceState({path,selected:opts.selected||''},'',stateURL(path,opts.selected||''));try{const data=await api('/api/files?path='+encodeURIComponent(path));fileDir=data;selectedFiles.clear();byId('selectAllFiles').checked=false;if(data.entry&&!data.entry.is_dir){selectedPath=data.entry.path;currentPath=parentPath(data.entry.path);byId('path').value=currentPath;fileRows=[];renderCrumbs(currentPath);renderFiles();renderFileInfo(data.entry);setHeaderStatus('Selected '+data.entry.name);if(opts.push)history.replaceState({path:currentPath,selected:selectedPath},'',stateURL(currentPath,selectedPath));}else{fileRows=(data.entries||[]);selectedPath=opts.selected||selectedPath;renderCrumbs(data.path||path);renderFiles();const selected=fileRows.find(e=>e.path===selectedPath);if(selected)renderFileInfo(selected);else hideFileInfo();setHeaderStatus('Browsing '+currentPath);if(opts.replace)history.replaceState({path:currentPath,selected:selectedPath||''},'',stateURL(currentPath,selectedPath||''));}setFileStatus('', '')}catch(e){setHeaderStatus('Error');setFileStatus(e.message,'danger-text')}finally{loadingFiles=false}}
-function hideFileInfo(){byId('fileInfo').innerHTML='<h2>No file selected</h2><p class="muted">Select a file or folder to inspect it. Double-click folders to open them.</p><dl><dt>Folder</dt><dd class="mono">'+esc(currentPath)+'</dd><dt>Items</dt><dd>'+fileRows.length+'</dd></dl>'}
-function renderFileInfo(e){selectedPath=e.path;byId('fileInfo').innerHTML='<h2>'+esc(e.name)+'</h2><dl><dt>Path</dt><dd class="mono">'+esc(e.path)+'</dd><dt>Type</dt><dd>'+(e.is_dir?'Folder':'File')+'</dd><dt>Size</dt><dd>'+esc(e.size_text||sizeText(e.size,e.is_dir))+'</dd><dt>Mode</dt><dd class="mono">'+esc(e.mode||'')+'</dd><dt>Modified</dt><dd class="mono">'+esc(new Date(e.mod_time).toLocaleString())+'</dd></dl><label>Rename or move to</label><input id="renamePath" class="mono" value="'+attr(e.path)+'"><div class="inspector-actions"><button type="button" id="renameFile">Rename</button><button type="button" id="copyFileTo">Copy to...</button><button type="button" id="moveFileTo">Move to...</button><button type="button" id="copyPath">Copy path</button>'+(e.is_dir?'<button type="button" id="openFolder" class="wide-action primary">Open folder</button>':'<a class="wide-action" href="'+attr(downloadURL(e.path))+'"><button type="button" class="wide-action">Download</button></a>')+'<button type="button" id="deleteFile" class="wide-action danger">Delete</button></div>';byId('renameFile').addEventListener('click',()=>renameFile(e.path));byId('copyFileTo').addEventListener('click',()=>fileAction('copy',[e.path]));byId('moveFileTo').addEventListener('click',()=>fileAction('move',[e.path]));byId('copyPath').addEventListener('click',()=>copyText(e.path));byId('deleteFile').addEventListener('click',()=>delFile(e.path));const open=byId('openFolder');if(open)open.addEventListener('click',()=>goPath(e.path))}
+function hideFileInfo(){syncLinkPath(null);byId('fileInfo').innerHTML='<h2>No file selected</h2><p class="muted">Select a file or folder to inspect it. Double-click folders to open them.</p><dl><dt>Folder</dt><dd class="mono">'+esc(currentPath)+'</dd><dt>Items</dt><dd>'+fileRows.length+'</dd></dl>'}
+function renderFileInfo(e){selectedPath=e.path;syncLinkPath(e);byId('fileInfo').innerHTML='<h2>'+esc(e.name)+'</h2><dl><dt>Path</dt><dd class="mono">'+esc(e.path)+'</dd><dt>Type</dt><dd>'+(e.is_dir?'Folder':'File')+'</dd><dt>Size</dt><dd>'+esc(e.size_text||sizeText(e.size,e.is_dir))+'</dd><dt>Mode</dt><dd class="mono">'+esc(e.mode||'')+'</dd><dt>Modified</dt><dd class="mono">'+esc(new Date(e.mod_time).toLocaleString())+'</dd></dl><label>Rename or move to</label><input id="renamePath" class="mono" value="'+attr(e.path)+'"><div class="inspector-actions"><button type="button" id="renameFile">Rename</button><button type="button" id="copyFileTo">Copy to...</button><button type="button" id="moveFileTo">Move to...</button><button type="button" id="copyPath">Copy path</button><button type="button" id="shareSelected" class="wide-action">Share this</button>'+(e.is_dir?'<button type="button" id="openFolder" class="wide-action primary">Open folder</button>':'<a class="wide-action" href="'+attr(downloadURL(e.path))+'"><button type="button" class="wide-action">Download</button></a>')+'<button type="button" id="deleteFile" class="wide-action danger">Delete</button></div><div id="fileStats" class="stats-list">Loading stats...</div>';byId('renameFile').addEventListener('click',()=>renameFile(e.path));byId('copyFileTo').addEventListener('click',()=>fileAction('copy',[e.path]));byId('moveFileTo').addEventListener('click',()=>fileAction('move',[e.path]));byId('copyPath').addEventListener('click',()=>copyText(e.path));byId('shareSelected').addEventListener('click',()=>{byId('linkKind').value=e.is_dir?'upload':'download';syncLinkPath(e);byId('linkPath').focus()});byId('deleteFile').addEventListener('click',()=>delFile(e.path));const open=byId('openFolder');if(open)open.addEventListener('click',()=>goPath(e.path));loadPathStats(e.path)}
 function renderCrumbs(p){const parts=cleanPath(p).split('/').filter(Boolean);let cur='';let html='<button data-path="/">root</button>';for(const part of parts){cur+='/'+part;html+='<button data-path="'+attr(cur)+'">'+esc(part)+'</button>'}byId('crumbs').innerHTML=html;byId('crumbs').querySelectorAll('[data-path]').forEach(b=>b.addEventListener('click',()=>goPath(b.dataset.path)))}
 function visibleRows(){const q=byId('fileSearch').value.trim().toLowerCase();return fileRows.filter(e=>!q||e.name.toLowerCase().includes(q)||e.path.toLowerCase().includes(q)).sort((a,b)=>{if(a.is_dir!==b.is_dir)return a.is_dir?-1:1;let av=a[fileSort],bv=b[fileSort];if(fileSort==='name'){av=String(av).toLowerCase();bv=String(bv).toLowerCase()}else{av=Number(av)||0;bv=Number(bv)||0}return (av>bv?1:av<bv?-1:0)*fileSortDir})}
 function renderFiles(){for(const k of ['name','size','mod_time'])byId('sort-'+k).textContent=fileSort===k?(fileSortDir>0?'up':'down'):'';const rows=visibleRows();byId('fileSummary').textContent=fileRows.length+' item'+(fileRows.length===1?'':'s')+(selectedFiles.size?' - '+selectedFiles.size+' selected':'');if(!rows.length){byId('files').innerHTML='<tr><td colspan="5" class="empty-state">'+(fileRows.length?'No matching files.':'This folder is empty.')+'</td></tr>';hideFileInfo();return}byId('files').innerHTML=rows.map(e=>'<tr data-path="'+attr(e.path)+'" class="'+(selectedPath===e.path?'selected':'')+'"><td class="file-check"><input type="checkbox" data-check-path="'+attr(e.path)+'" '+(selectedFiles.has(e.path)?'checked':'')+'></td><td><div class="file-name"><span class="file-icon">'+(e.is_dir?'DIR':'FILE')+'</span><strong>'+esc(e.name)+'</strong></div></td><td class="right mono">'+sizeText(e.size,e.is_dir)+'</td><td class="mono">'+esc(new Date(e.mod_time).toLocaleString())+'</td><td class="actions">'+(e.is_dir?'<button data-open-path="'+attr(e.path)+'">Open</button>':'<a href="'+attr(downloadURL(e.path))+'"><button type="button">Download</button></a>')+'<button data-delete-path="'+attr(e.path)+'" class="danger">Delete</button></td></tr>').join('');byId('files').querySelectorAll('tr[data-path]').forEach(row=>{row.addEventListener('click',ev=>{if(ev.target.closest('button,a,input'))return;selectEntry(row.dataset.path,true)});row.addEventListener('dblclick',()=>{const e=fileRows.find(x=>x.path===row.dataset.path);if(e&&e.is_dir)goPath(e.path)})});byId('files').querySelectorAll('[data-open-path]').forEach(b=>b.addEventListener('click',()=>goPath(b.dataset.openPath)));byId('files').querySelectorAll('[data-delete-path]').forEach(b=>b.addEventListener('click',()=>delFile(b.dataset.deletePath)));byId('files').querySelectorAll('[data-check-path]').forEach(c=>c.addEventListener('change',()=>{if(c.checked)selectedFiles.add(c.dataset.checkPath);else selectedFiles.delete(c.dataset.checkPath);renderFiles()}));const selected=fileRows.find(e=>e.path===selectedPath);if(selected)renderFileInfo(selected);else hideFileInfo()}
@@ -1650,11 +1927,14 @@ function renderActivity(){byId('activityFeed').innerHTML=activityRows.map(e=>'<d
 async function loadActivity(){try{const data=await api('/api/activity?limit=80');activityRows=data.events||[];activityLastID=activityRows.reduce((m,e)=>Math.max(m,e.id||0),activityLastID);renderActivity()}catch(e){byId('activityFeed').innerHTML='<div class="danger-text">'+esc(e.message)+'</div>'}}
 async function pollActivity(){try{const data=await api('/api/activity?limit=80&after='+activityLastID);const fresh=data.events||[];if(fresh.length){activityRows=[...fresh,...activityRows].sort((a,b)=>b.id-a.id).slice(0,80);activityLastID=activityRows.reduce((m,e)=>Math.max(m,e.id||0),activityLastID);renderActivity()}}catch(e){}}
 async function loadLiveStatus(){try{const data=await api('/api/status');const rows=data.sessions||[];byId('liveStatus').innerHTML=rows.map(s=>'<div class="activity-item"><div class="activity-time">'+esc(s.protocol)+' #'+esc(s.id)+'</div><div><div class="activity-msg">'+esc([s.user||'anonymous',s.action||'connected',s.path||''].filter(Boolean).join(' - '))+'</div><div class="activity-meta">'+esc([s.remote,s.secure?'TLS':'clear',s.mode,s.bytes?sizeText(s.bytes,false):''].filter(Boolean).join(' - '))+'</div></div><div class="activity-pill ok">'+esc(new Date(s.updated_at).toLocaleTimeString())+'</div></div>').join('')||'<div class="muted">No active sessions.</div>'}catch(e){byId('liveStatus').innerHTML='<div class="danger-text">'+esc(e.message)+'</div>'}}
-async function createLink(){try{const body={kind:byId('linkKind').value,path:byId('linkPath').value,expires_in:byId('linkExpires').value,password:byId('linkPassword').value,allow_overwrite:true};const data=await api('/api/shares',{method:'POST',body:JSON.stringify(body)});byId('linksOut').textContent=data.url;loadLinks()}catch(e){byId('linksOut').textContent=e.message}}
-async function loadLinks(){try{const data=await api('/api/shares');if(!byId('linksOut').textContent)byId('linksOut').textContent=(data.links||[]).map(l=>l.kind+' '+l.path+' '+l.id+(l.expires_at?' expires '+new Date(l.expires_at).toLocaleString():'')).join('\n')}catch(e){}}
+async function loadPathStats(path){try{const data=await api('/api/stats?path='+encodeURIComponent(path));const s=data.stats||{};const refs=s.referrers?Object.entries(s.referrers).sort((a,b)=>b[1]-a[1]).slice(0,4):[];const recent=(s.recent||[]).slice(0,3).map(e=>new Date(e.time).toLocaleString()+' '+(e.remote||'')).join('<br>');const box=byId('fileStats');if(box)box.innerHTML='<p><strong>Downloads</strong>: '+esc(s.downloads||0)+(s.last_download_at?' · last '+esc(new Date(s.last_download_at).toLocaleString()):'')+'</p>'+(refs.length?'<p><strong>Referrers</strong><br>'+refs.map(r=>esc(r[0])+' ('+r[1]+')').join('<br>')+'</p>':'')+(recent?'<p><strong>Recent</strong><br>'+recent+'</p>':'')}catch(e){const box=byId('fileStats');if(box)box.textContent='Stats unavailable: '+e.message}}
+async function createLink(){try{const expires=byId('linkExpires').value;const body={kind:byId('linkKind').value,path:byId('linkPath').value,expires_in:expires,password:byId('linkPassword').value,allow_overwrite:true};const data=await api('/api/shares',{method:'POST',body:JSON.stringify(body)});linkURLs[data.link.id]=data.url;byId('linksOut').innerHTML='Created <a class="link-url" href="'+attr(data.url)+'">'+esc(data.url)+'</a>';byId('linkPassword').value='';loadLinks()}catch(e){byId('linksOut').textContent=e.message}}
+async function revokeLink(id){try{if(!confirm('Revoke link '+id+'?'))return;await api('/api/shares/'+encodeURIComponent(id),{method:'DELETE'});delete linkURLs[id];byId('linksOut').textContent='Revoked '+id;loadLinks()}catch(e){byId('linksOut').textContent=e.message}}
+function linkExpiryText(l){if(l.max_downloads===1)return '1 download';if(!l.expires_at)return 'never';return new Date(l.expires_at).toLocaleString()}
+async function loadLinks(){try{const data=await api('/api/shares');const links=data.links||[];byId('linksList').innerHTML=links.map(l=>'<div class="link-item"><div><div><strong>'+esc(l.kind)+'</strong> <span class="mono">'+esc(l.path)+'</span></div><div class="activity-meta">'+esc([linkExpiryText(l),l.download_count+' downloads',l.has_password?'password':''].filter(Boolean).join(' - '))+'</div>'+(linkURLs[l.id]?'<a class="link-url" href="'+attr(linkURLs[l.id])+'">'+esc(linkURLs[l.id])+'</a>':'<div class="activity-meta">Token URL is shown when the link is created.</div>')+'</div><button data-revoke-link="'+attr(l.id)+'" class="danger">Revoke</button></div>').join('')||'<div class="muted">No active links.</div>';byId('linksList').querySelectorAll('[data-revoke-link]').forEach(b=>b.addEventListener('click',()=>revokeLink(b.dataset.revokeLink)))}catch(e){byId('linksList').innerHTML='<div class="danger-text">'+esc(e.message)+'</div>'}}
 async function loadRetention(kind){try{const data=await api('/api/retention?kind='+encodeURIComponent(kind));byId('retentionList').innerHTML=(data.items||[]).map(i=>'<div class="activity-item"><div class="activity-time">'+esc(kind)+'</div><div><div class="activity-msg">'+esc(i.original_path)+'</div><div class="activity-meta">'+esc([i.id,i.is_dir?'folder':sizeText(i.size,false)].join(' - '))+'</div></div><button data-restore="'+attr(i.id)+'" data-kind="'+attr(kind)+'">Restore</button></div>').join('')||'<div class="muted">Nothing retained.</div>';byId('retentionList').querySelectorAll('[data-restore]').forEach(b=>b.addEventListener('click',()=>restoreRetained(b.dataset.kind,b.dataset.restore)))}catch(e){byId('retentionList').innerHTML='<div class="danger-text">'+esc(e.message)+'</div>'}}
 async function restoreRetained(kind,id){try{const dest=prompt('Restore to path (blank for original)','');await api('/api/retention/restore',{method:'POST',body:JSON.stringify({kind,id,dest_path:dest,overwrite:false})});loadRetention(kind);loadFiles(currentPath,{replace:true})}catch(e){alert(e.message)}}
-function bindFileBrowser(){byId('goBtn').addEventListener('click',()=>goPath(byId('path').value));byId('path').addEventListener('keydown',e=>{if(e.key==='Enter')goPath(byId('path').value)});byId('upBtn').addEventListener('click',()=>goPath(parentPath(currentPath)));byId('homeBtn').addEventListener('click',()=>goPath('/'));byId('refreshBtn').addEventListener('click',()=>loadFiles(currentPath,{replace:true,selected:selectedPath}));byId('mkdirBtn').addEventListener('click',mkdir);byId('copySelectedBtn').addEventListener('click',()=>fileAction('copy'));byId('moveSelectedBtn').addEventListener('click',()=>fileAction('move'));byId('bulkDeleteBtn').addEventListener('click',bulkDelete);byId('clearSelectionBtn').addEventListener('click',()=>{selectedFiles.clear();selectedPath='';renderFiles();history.replaceState({path:currentPath,selected:''},'',stateURL(currentPath,''))});byId('fileSearch').addEventListener('input',renderFiles);byId('selectAllFiles').addEventListener('change',e=>{if(e.target.checked)visibleRows().forEach(r=>selectedFiles.add(r.path));else selectedFiles.clear();renderFiles()});document.querySelectorAll('.file-table th button[data-sort]').forEach(b=>b.addEventListener('click',()=>sortFiles(b.dataset.sort)));byId('uploadForm').addEventListener('submit',e=>{e.preventDefault();uploadFiles(byId('uploadFile').files)});byId('refreshActivityBtn').addEventListener('click',loadActivity);byId('refreshStatusBtn').addEventListener('click',loadLiveStatus);byId('createLinkBtn').addEventListener('click',createLink);byId('doctorBtn').addEventListener('click',doctor);byId('loadTrashBtn').addEventListener('click',()=>loadRetention('trash'));byId('loadVersionsBtn').addEventListener('click',()=>loadRetention('versions'));const dz=byId('dropzone');for(const ev of ['dragenter','dragover'])dz.addEventListener(ev,e=>{e.preventDefault();dz.classList.add('drag')});for(const ev of ['dragleave','drop'])dz.addEventListener(ev,e=>{e.preventDefault();dz.classList.remove('drag')});dz.addEventListener('drop',e=>uploadFiles(e.dataTransfer.files));window.addEventListener('popstate',()=>{selectedPath=initialSelected();loadFiles(initialPath(),{replace:false,selected:selectedPath})})}
+function bindFileBrowser(){byId('goBtn').addEventListener('click',()=>goPath(byId('path').value));byId('path').addEventListener('keydown',e=>{if(e.key==='Enter')goPath(byId('path').value)});byId('upBtn').addEventListener('click',()=>goPath(parentPath(currentPath)));byId('homeBtn').addEventListener('click',()=>goPath('/'));byId('refreshBtn').addEventListener('click',()=>loadFiles(currentPath,{replace:true,selected:selectedPath}));byId('mkdirBtn').addEventListener('click',mkdir);byId('copySelectedBtn').addEventListener('click',()=>fileAction('copy'));byId('moveSelectedBtn').addEventListener('click',()=>fileAction('move'));byId('bulkDeleteBtn').addEventListener('click',bulkDelete);byId('clearSelectionBtn').addEventListener('click',()=>{selectedFiles.clear();selectedPath='';renderFiles();history.replaceState({path:currentPath,selected:''},'',stateURL(currentPath,''))});byId('fileSearch').addEventListener('input',renderFiles);byId('selectAllFiles').addEventListener('change',e=>{if(e.target.checked)visibleRows().forEach(r=>selectedFiles.add(r.path));else selectedFiles.clear();renderFiles()});document.querySelectorAll('.file-table th button[data-sort]').forEach(b=>b.addEventListener('click',()=>sortFiles(b.dataset.sort)));byId('uploadForm').addEventListener('submit',e=>{e.preventDefault();uploadFiles(byId('uploadFile').files)});byId('refreshActivityBtn').addEventListener('click',loadActivity);byId('refreshStatusBtn').addEventListener('click',loadLiveStatus);byId('createLinkBtn').addEventListener('click',createLink);byId('refreshLinksBtn').addEventListener('click',loadLinks);byId('linkKind').addEventListener('change',()=>syncLinkPath(selectedEntry()));byId('doctorBtn').addEventListener('click',doctor);byId('loadTrashBtn').addEventListener('click',()=>loadRetention('trash'));byId('loadVersionsBtn').addEventListener('click',()=>loadRetention('versions'));const dz=byId('dropzone');for(const ev of ['dragenter','dragover'])dz.addEventListener(ev,e=>{e.preventDefault();dz.classList.add('drag')});for(const ev of ['dragleave','drop'])dz.addEventListener(ev,e=>{e.preventDefault();dz.classList.remove('drag')});dz.addEventListener('drop',e=>uploadFiles(e.dataTransfer.files));window.addEventListener('popstate',()=>{selectedPath=initialSelected();loadFiles(initialPath(),{replace:false,selected:selectedPath})})}
 async function purge(){try{byId('cf').textContent=JSON.stringify(await api('/api/cloudflare/purge',{method:'POST',body:'{}'}),null,2)}catch(e){byId('cf').textContent=e.message}}
 async function doctor(){try{byId('cf').textContent=JSON.stringify(await api('/api/doctor'),null,2)}catch(e){byId('cf').textContent=e.message}}
 async function init(){try{await loginFromURLCredentials()}catch(e){byId('status').textContent='Login setup failed: '+e.message;return}bindFileBrowser();selectedPath=initialSelected();history.replaceState({path:initialPath(),selected:selectedPath},'',stateURL(initialPath(),selectedPath));loadUsers();loadFiles(initialPath(),{selected:selectedPath});loadActivity();loadLiveStatus();loadLinks();setInterval(pollActivity,3000);setInterval(loadLiveStatus,3000)}

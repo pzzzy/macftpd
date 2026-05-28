@@ -6,6 +6,7 @@ import (
 	"mime/multipart"
 	"net/http"
 	"net/http/httptest"
+	"net/url"
 	"os"
 	"strconv"
 	"strings"
@@ -241,6 +242,90 @@ func TestChunkedUploadAssemblesAndVersions(t *testing.T) {
 	}
 }
 
+func TestShareLinkServesBareFileWithStatsAndExpiry(t *testing.T) {
+	srv := testServer(t)
+	name := "[1997-06-28] Glastonbury.MP4"
+	if err := os.WriteFile(srv.root.Base+"/public/"+name, []byte("video"), 0o640); err != nil {
+		t.Fatal(err)
+	}
+	created, err := srv.links.Create(share.CreateRequest{Kind: share.KindDownload, Path: "/public/" + name, CreatedBy: "admin", MaxDownloads: 1})
+	if err != nil {
+		t.Fatal(err)
+	}
+	sharePath := "/s/" + created.Link.ID + "/" + created.Token + "/" + url.PathEscape(name)
+	req := httptest.NewRequest(http.MethodGet, sharePath, nil)
+	req.Header.Set("Referer", "https://example.test/page")
+	rr := httptest.NewRecorder()
+	srv.shareLink(rr, req)
+	if rr.Code != http.StatusOK || rr.Body.String() != "video" {
+		t.Fatalf("share status=%d body=%q", rr.Code, rr.Body.String())
+	}
+	if got := rr.Header().Get("Content-Disposition"); !strings.Contains(got, "inline") || !strings.Contains(got, "filename*=") {
+		t.Fatalf("bad disposition %q", got)
+	}
+	req = httptest.NewRequest(http.MethodGet, sharePath, nil)
+	rr = httptest.NewRecorder()
+	srv.shareLink(rr, req)
+	if rr.Code != http.StatusGone {
+		t.Fatalf("one-download link should be gone, got %d", rr.Code)
+	}
+	stats := srv.activity.StatsForPath("/public/"+name, 10)
+	if stats.Downloads != 1 || stats.Referrers["https://example.test/page"] != 1 {
+		t.Fatalf("bad stats %#v", stats)
+	}
+}
+
+func TestDropLinkSupportsChunkedUpload(t *testing.T) {
+	srv := testServer(t)
+	created, err := srv.links.Create(share.CreateRequest{Kind: share.KindUpload, Path: "/public", CreatedBy: "admin", AllowOverwrite: true})
+	if err != nil {
+		t.Fatal(err)
+	}
+	chunks := []struct {
+		offset int64
+		data   string
+	}{
+		{0, "drop "},
+		{5, "payload"},
+	}
+	for _, chunk := range chunks {
+		var body bytes.Buffer
+		mw := multipart.NewWriter(&body)
+		fields := map[string]string{
+			"filename":   "upload.zip",
+			"upload_id":  "drop-test-1234",
+			"offset":     strconv.FormatInt(chunk.offset, 10),
+			"total_size": "12",
+		}
+		for k, v := range fields {
+			if err := mw.WriteField(k, v); err != nil {
+				t.Fatal(err)
+			}
+		}
+		part, err := mw.CreateFormFile("chunk", "upload.zip")
+		if err != nil {
+			t.Fatal(err)
+		}
+		if _, err := part.Write([]byte(chunk.data)); err != nil {
+			t.Fatal(err)
+		}
+		if err := mw.Close(); err != nil {
+			t.Fatal(err)
+		}
+		req := httptest.NewRequest(http.MethodPost, "/d/"+created.Link.ID+"/"+created.Token, &body)
+		req.Header.Set("Content-Type", mw.FormDataContentType())
+		rr := httptest.NewRecorder()
+		srv.dropLink(rr, req)
+		if rr.Code != http.StatusOK {
+			t.Fatalf("chunk offset %d status=%d body=%s", chunk.offset, rr.Code, rr.Body.String())
+		}
+	}
+	raw, err := os.ReadFile(srv.root.Base + "/public/upload.zip")
+	if err != nil || string(raw) != "drop payload" {
+		t.Fatalf("drop payload=%q err=%v", string(raw), err)
+	}
+}
+
 func TestUsersAPIRejectsPasswordHashMassAssignment(t *testing.T) {
 	srv := testServer(t)
 	body := strings.NewReader(`{"username":"hashonly","password_hash":"pbkdf2-sha256$1$bad$bad","home":"/hashonly","permissions":{"list":true}}`)
@@ -338,7 +423,7 @@ func TestAdminFileBrowserUsesHistoryState(t *testing.T) {
 		t.Fatalf("status = %d body=%s", rr.Code, rr.Body.String())
 	}
 	body := rr.Body.String()
-	for _, needle := range []string{"fileSearch", "history.pushState", "popstate", "Copy selected", "Activity", "uploadForm"} {
+	for _, needle := range []string{"fileSearch", "history.pushState", "popstate", "Copy selected", "Activity", "uploadForm", "Share selected", "1 download", "revokeLink"} {
 		if !strings.Contains(body, needle) {
 			t.Fatalf("admin file browser missing %q", needle)
 		}
