@@ -31,7 +31,7 @@ var (
 	publicListingTemplate    = mustTemplate("public_listing.html")
 )
 
-const uiAssetVersion = "20260528-dark-ux"
+const uiAssetVersion = "20260528-retention-scroll"
 
 func mustTemplate(name string) *template.Template {
 	return template.Must(template.New(name).Funcs(templateFuncs()).ParseFS(uiFS, "templates/"+name))
