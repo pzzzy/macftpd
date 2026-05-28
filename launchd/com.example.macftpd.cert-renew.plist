@@ -1,0 +1,40 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+  <key>Label</key>
+  <string>com.example.macftpd.cert-renew</string>
+  <key>ProgramArguments</key>
+  <array>
+    <string>/opt/macftpd/bin/renew-ftps-cert.sh</string>
+  </array>
+  <key>EnvironmentVariables</key>
+  <dict>
+    <key>MACFTPD_APP_DIR</key>
+    <string>/opt/macftpd</string>
+    <key>MACFTPD_ACME_DOMAIN</key>
+    <string>ftp.example.com</string>
+    <key>MACFTPD_RENEW_JITTER_SECONDS</key>
+    <string>3600</string>
+  </dict>
+  <key>StartCalendarInterval</key>
+  <array>
+    <dict>
+      <key>Hour</key>
+      <integer>3</integer>
+      <key>Minute</key>
+      <integer>17</integer>
+    </dict>
+    <dict>
+      <key>Hour</key>
+      <integer>15</integer>
+      <key>Minute</key>
+      <integer>17</integer>
+    </dict>
+  </array>
+  <key>StandardOutPath</key>
+  <string>/opt/macftpd/var/cert-renew.log</string>
+  <key>StandardErrorPath</key>
+  <string>/opt/macftpd/var/cert-renew.err.log</string>
+</dict>
+</plist>
