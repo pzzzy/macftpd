@@ -8,9 +8,12 @@ Current capabilities:
 - Explicit FTPS with `AUTH TLS`, `PBSZ`, `PROT`, plus modern `MLSD`/`MLST` listings.
 - User and group permissions for list, download, upload, delete, mkdir, rename, admin, public, and dropbox workflows.
 - Storage-root containment, default macOS/security ignore rules, and virtual `public`/`dropbox` mounts for permitted users.
-- HTTP admin UI and JSON API for user management, file listing/detail/download/upload/rename/delete, public share links, upload drop links, live session status, trash/version restore, Cloudflare purge, and remote FTP pull into local storage.
-- Public HTTP file serving from the configured `public` folder with cache headers and optional Cloudflare cache tags.
-- NAT-PMP automatic TCP port mapping for FTP control and passive data ports when the router supports it.
+- HTTP admin UI and JSON API for user management, file listing/detail/download/chunked-upload/rename/delete, copy/move, public share links, upload drop links, link revocation, live session status, trash/version restore, Cloudflare purge, and remote FTP pull into local storage.
+- Public HTTP file serving from the configured `public` folder with sortable directory listings, cache headers, optional Cloudflare cache tags, and download/referrer analytics.
+- Short direct share URLs (`/s/<id>/<token>/<filename>`) that serve bare files with correct MIME and `Content-Disposition` behavior; image/video/PDF/text content opens inline, archive-style content downloads.
+- Password-protected share/drop links with secure share-scoped cookies, one-download links, timed expiry, never-expiring links, and admin-visible persistent link URLs.
+- Public upload drops (`/d/<id>/<token>`) with the same chunked upload path as the admin UI; uploads into `public` return the public download URL.
+- NAT-PMP and UPnP IGD automatic TCP port mapping for FTP control and passive data ports when the router supports it.
 - Remote macOS deployment through launchd with a repairable `/opt/macftpd` app folder and `/srv/macftpd/files` storage root.
 
 ## Local Development
@@ -49,6 +52,14 @@ ADMIN_PASS='choose-a-strong-password' ./scripts/deploy-remote-macos.sh
 ```
 
 The first deploy writes `/opt/macftpd/config.json`. Later deploys merge generated operational settings into the active config while preserving secrets such as the admin password and session key. The previous active config is backed up as `config.json.backup.<timestamp>`, and the generated config is also kept as `config.json.last_deployed`.
+
+Override `REMOTE_DIR` and `STORAGE_ROOT` for site-specific installs, for example a home-directory app folder with an external-volume FTP root:
+
+```bash
+REMOTE='macftpd@example-host.local' KEY='/path/to/ssh-key' \
+REMOTE_DIR='~/macftpd' STORAGE_ROOT='/path/to/ftpd-storage' \
+ADMIN_PASS='choose-a-strong-password' ./scripts/deploy-remote-macos.sh
+```
 
 By default the deploy starts the service in `START_MODE=manual`, launched over SSH. This is useful while validating macOS privacy permissions for external or removable storage. After granting the binary external volume or Full Disk Access, use:
 
@@ -97,6 +108,45 @@ CF_ACCOUNT_ID=... CF_API_TOKEN=... ALLOW_EMAILS='admin@example.com' ./scripts/cl
 
 `cloudflare-hardening.sh` maintains a zone WAF ruleset for the public hostname. `cloudflare-access-admin.sh` creates or updates a Cloudflare Access self-hosted application for `/admin*`; keep the built-in macftpd admin login enabled as a second layer.
 
+## Shares, Drops, And Public Analytics
+
+Admins can create and revoke links from the `/admin` Links panel or the `/api/shares` endpoint. New links persist their token-bearing URL path in `var/shares.json` so the admin list can continue showing useful URLs after refresh. Existing legacy links that were created before URL persistence may need to be revoked and recreated if their full token URL is no longer known.
+
+Download shares use short `/s/<id>/<token>` URLs. For file shares, macftpd appends the original filename to the returned URL for readability without leaking the storage path. The share handler still authorizes by id/token, not by the display filename. Shared files are served directly: images, videos, audio, PDFs, and text are inline by default, while other file types use attachment disposition. Add `?download=1` to force attachment behavior.
+
+Upload drops use `/d/<id>/<token>` URLs. Protected drops first accept a password form, then set a secure, HttpOnly, share-scoped cookie before showing the compact chunked upload UI. Drops created against the public folder return a `public_url` after upload, such as `/public/example.mp4`.
+
+Public and shared downloads are recorded in the activity log with count, last download time, remote address, byte count, and HTTP referrer. Admin file detail cards summarize these stats through `/api/stats?path=<storage-path>`.
+
+Expiry presets in the admin UI are `1 download`, `1h`, `12h`, `24h`, `1w`, `1m`, and `never`.
+
+## HTTP API Highlights
+
+All `/api/*` endpoints require an admin session or HTTP Basic auth unless noted. Unsafe methods enforce same-origin checks using `Origin`, Fetch Metadata, and Cloudflare forwarded-host headers.
+
+```bash
+auth=(-u "$MACFTPD_ADMIN_USER:$MACFTPD_ADMIN_PASS")
+
+# Create a direct download share.
+curl "${auth[@]}" -H 'content-type: application/json' \
+  -d '{"kind":"download","path":"/public/example.mp4","expires_in":"24h"}' \
+  https://ftp.example.com/api/shares
+
+# Create a password-protected public upload drop.
+curl "${auth[@]}" -H 'content-type: application/json' \
+  -d '{"kind":"upload","path":"/public","expires_in":"1h","password":"optional"}' \
+  https://ftp.example.com/api/shares
+
+# List and revoke links.
+curl "${auth[@]}" https://ftp.example.com/api/shares
+curl "${auth[@]}" -X DELETE https://ftp.example.com/api/shares/<id>
+
+# Inspect public/share download stats for a storage path.
+curl "${auth[@]}" 'https://ftp.example.com/api/stats?path=/public/example.mp4'
+```
+
+Other admin endpoints include `/api/users`, `/api/groups`, `/api/files`, `/api/files/action`, `/api/upload/chunk`, `/api/download`, `/api/fxp`, `/api/activity`, `/api/status`, `/api/doctor`, `/api/retention`, `/api/retention/restore`, and `/api/cloudflare/purge`.
+
 ## Release Gate
 
 Before a release candidate, run:
@@ -105,13 +155,14 @@ Before a release candidate, run:
 go test ./...
 go test -race ./...
 go vet ./...
+./scripts/check-private-identifiers.sh
 go run github.com/securego/gosec/v2/cmd/gosec@latest ./...
 go run golang.org/x/vuln/cmd/govulncheck@latest ./...
 wrangler deploy --config cloudflare/wrangler.jsonc --dry-run
 ADMIN_PASS="$(cat var/admin-pass.txt)" ./scripts/smoke-remote.sh
 ```
 
-Then verify through `https://ftp.example.com`: admin login, create/edit/delete a test user, public cache `MISS` then `HIT`, and the remote Mac monitor screen showing `status=ok`.
+Then verify through `https://ftp.example.com`: admin login, create/edit/delete a test user, chunked admin upload of a large file, direct `/s/` share of that file with correct MIME/disposition, protected `/d/` drop upload, public cache `MISS` then `HIT`, and the remote Mac monitor screen showing `status=ok`.
 
 ## Network Notes
 
@@ -121,7 +172,7 @@ For internet exposure, macftpd can automatically map these with NAT-PMP and UPnP
 - TCP `50000-50100` to the remote Mac for passive FTP data.
 - TCP `8080` or a reverse-proxied HTTPS endpoint for HTTP/admin/public.
 
-Use `"external_ip": "auto"` with `"auto_map": true` to advertise the discovered public address in classic PASV replies. Passive FTP data ports are mapped on demand and released after the data connection is closed or the passive setup is abandoned. Set `ftp.external_ip` to a fixed public IP or DNS target if the router does not support automatic mapping. EPSV-capable clients usually work better through NAT.
+Use `"external_ip": "auto"` with `"auto_map": true` to advertise the discovered public address in classic PASV replies. Passive FTP data ports are mapped on demand and released after the data connection is closed or the passive setup is abandoned. macftpd tries NAT-PMP and UPnP IGD when available. Set `ftp.external_ip` to a fixed public IP or DNS target if the router does not support automatic mapping. EPSV-capable clients usually work better through NAT.
 
 Default storage ignore rules hide and deny downloads for macOS metadata and sensitive dot-directories such as `.DS_Store`, `._*`, `.AppleDouble`, `.Spotlight-V100`, `.Trashes`, `.git`, `.env`, and `.ssh`. Adjust `storage.ignore` in `config.json` if you need a different policy.
 
