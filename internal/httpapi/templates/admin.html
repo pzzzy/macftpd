@@ -15,7 +15,7 @@
 </head>
 <body>
   <div class="min-h-screen">
-    <header class="sticky top-0 z-30 border-b border-base-300 bg-white/95 backdrop-blur">
+    <header class="sticky top-0 z-30 border-b border-base-300 bg-base-200/95 backdrop-blur">
       <div class="flex min-h-16 flex-wrap items-center justify-between gap-3 px-4 py-3 lg:px-6">
         <div>
           <h1 class="text-xl font-semibold leading-tight">macftpd</h1>
@@ -29,7 +29,7 @@
       </div>
     </header>
 
-    <main class="grid gap-4 p-4 lg:grid-cols-[minmax(0,1fr)_380px] lg:p-6">
+    <main class="space-y-4 p-4 lg:p-6">
       <section class="min-w-0">
         <div id="admin-notice" class="hidden"></div>
         <div id="file-workspace"
@@ -43,7 +43,7 @@
         </div>
       </section>
 
-      <aside class="grid content-start gap-4">
+      <section class="grid gap-4 xl:grid-cols-[360px_minmax(0,1fr)]">
         <section id="status-panel"
           class="mac-panel rounded-box p-4"
           hx-get="/admin/partials/status"
@@ -59,18 +59,10 @@
           hx-swap="innerHTML">
           <span class="loading loading-spinner loading-sm"></span>
         </section>
-
-        <section id="activity-panel"
-          class="mac-panel rounded-box p-4"
-          hx-get="/admin/partials/activity"
-          hx-trigger="load, refresh from:body, every 4s"
-          hx-swap="innerHTML">
-          <span class="loading loading-spinner loading-sm"></span>
-        </section>
-      </aside>
+      </section>
 
       <section id="users-panel"
-        class="mac-panel rounded-box p-4 lg:col-span-2"
+        class="mac-panel rounded-box p-4"
         hx-get="/admin/partials/users"
         hx-trigger="load"
         hx-swap="innerHTML">
@@ -78,9 +70,17 @@
       </section>
 
       <section id="retention-panel"
-        class="mac-panel rounded-box p-4 lg:col-span-2"
+        class="mac-panel rounded-box p-4"
         hx-get="/admin/partials/retention?kind=trash"
         hx-trigger="load"
+        hx-swap="innerHTML">
+        <span class="loading loading-spinner loading-sm"></span>
+      </section>
+
+      <section id="activity-panel"
+        class="mac-panel rounded-box p-4"
+        hx-get="/admin/partials/activity"
+        hx-trigger="load, refresh from:body, every 4s"
         hx-swap="innerHTML">
         <span class="loading loading-spinner loading-sm"></span>
       </section>

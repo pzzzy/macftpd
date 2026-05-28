@@ -7,7 +7,7 @@
   <link rel="stylesheet" href="/assets/macftpd.css">
 </head>
 <body>
-  <header class="border-b border-base-300 bg-white">
+  <header class="border-b border-base-300 bg-base-200/95">
     <div class="mx-auto max-w-6xl px-4 py-6">
       <h1 class="text-3xl font-semibold">Public Files</h1>
       <p class="mt-2 break-all font-mono text-sm text-base-content/60">{{.Path}} · updated {{.Updated}}</p>
@@ -22,7 +22,7 @@
       </label>
       <span class="text-sm text-base-content/60">{{len .Rows}} item{{if ne (len .Rows) 1}}s{{end}}</span>
     </div>
-    <div class="overflow-hidden rounded-box border border-base-300 bg-white">
+    <div class="overflow-hidden rounded-box border border-base-300 bg-base-200/95">
       <table id="listing" class="table table-sm">
         <thead><tr><th><button data-sort="name">Name</button></th><th class="text-right"><button data-sort="size">Size</button></th><th class="hidden md:table-cell"><button data-sort="modified">Modified</button></th></tr></thead>
         <tbody>
@@ -31,7 +31,7 @@
               <td class="min-w-0">
                 <div class="flex items-center gap-2">
                   <span class="badge badge-sm {{if .IsDir}}badge-primary{{else}}badge-ghost{{end}}">{{if .IsDir}}DIR{{else}}FILE{{end}}</span>
-                  <a class="truncate font-medium text-primary hover:underline" href="{{.Href}}">{{.Name}}</a>
+                  <a class="break-all font-medium text-primary hover:underline" href="{{.Href}}">{{.Name}}</a>
                   {{if not .IsDir}}<a class="text-xs text-base-content/50 hover:text-primary" href="{{.InfoHref}}">info</a>{{end}}
                 </div>
               </td>
