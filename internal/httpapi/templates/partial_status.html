@@ -1,0 +1,39 @@
+<div class="flex items-center justify-between gap-3">
+  <div>
+    <p class="mac-section-title">Health</p>
+    <h2 class="mt-1 text-lg font-semibold">Status</h2>
+  </div>
+  <span class="text-xs text-base-content/60">{{formatTime .Time}}</span>
+</div>
+
+<div class="mt-3 grid gap-2">
+  {{range .Checks}}
+    <div class="flex items-start justify-between gap-3 rounded-box bg-base-200 px-3 py-2 text-sm">
+      <div class="min-w-0">
+        <div class="font-medium">{{index . "name"}}</div>
+        <div class="truncate text-xs text-base-content/60">{{index . "detail"}}</div>
+      </div>
+      {{if index . "ok"}}<span class="badge badge-success badge-sm">ok</span>{{else}}<span class="badge badge-error badge-sm">fail</span>{{end}}
+    </div>
+  {{end}}
+</div>
+
+<div class="mt-4">
+  <div class="mb-2 flex items-center justify-between">
+    <h3 class="text-sm font-semibold">Sessions</h3>
+    <span class="badge badge-ghost badge-sm">{{len .Sessions}}</span>
+  </div>
+  <div class="max-h-48 space-y-2 overflow-auto mac-scroll">
+    {{range .Sessions}}
+      <div class="rounded-box border border-base-300 p-2 text-sm">
+        <div class="flex items-center justify-between gap-2">
+          <span class="font-mono">{{.Protocol}} #{{.ID}}</span>
+          <span class="badge badge-sm {{if .Secure}}badge-success{{else}}badge-warning{{end}}">{{if .Secure}}TLS{{else}}clear{{end}}</span>
+        </div>
+        <div class="mt-1 truncate text-xs text-base-content/60">{{.User}} {{.Action}} {{.Path}}</div>
+      </div>
+    {{else}}
+      <p class="py-4 text-center text-sm text-base-content/60">No active sessions.</p>
+    {{end}}
+  </div>
+</div>

@@ -1,0 +1,82 @@
+<div class="flex flex-wrap items-center justify-between gap-3">
+  <div>
+    <p class="mac-section-title">Users and Permissions</p>
+    <h2 class="mt-1 text-lg font-semibold">Accounts</h2>
+  </div>
+  {{if .Status}}<div class="alert alert-success w-auto py-2 text-sm">{{.Status}}</div>{{end}}
+  {{if .Error}}<div class="alert alert-error w-auto py-2 text-sm">{{.Error}}</div>{{end}}
+</div>
+
+<div class="mt-4 grid gap-4 lg:grid-cols-[minmax(0,1fr)_360px]">
+  <div class="overflow-auto rounded-box border border-base-300">
+    <table class="table table-sm">
+      <thead><tr><th>User</th><th>Home</th><th>Groups</th><th>Flags</th><th></th></tr></thead>
+      <tbody>
+        {{range .Users}}
+          <tr>
+            <td class="font-mono font-medium">{{.Username}}</td>
+            <td class="font-mono text-xs">{{.Home}}</td>
+            <td>{{join .Groups ", "}}</td>
+            <td class="text-xs">
+              {{if .Disabled}}<span class="badge badge-error badge-sm">disabled</span>{{end}}
+              {{if .Permissions.Admin}}<span class="badge badge-primary badge-sm">admin</span>{{end}}
+              {{if .Permissions.Public}}<span class="badge badge-ghost badge-sm">public</span>{{end}}
+              {{if .Permissions.Dropbox}}<span class="badge badge-ghost badge-sm">dropbox</span>{{end}}
+            </td>
+            <td class="text-right">
+              <button class="btn btn-xs" hx-get="/admin/partials/users?edit={{queryEscape .Username}}" hx-target="#users-panel" hx-swap="innerHTML">Edit</button>
+              <button class="btn btn-xs btn-error btn-outline"
+                hx-delete="/admin/partials/users?username={{queryEscape .Username}}"
+                hx-target="#users-panel"
+                hx-swap="innerHTML"
+                hx-confirm="Delete user {{.Username}}?">Delete</button>
+            </td>
+          </tr>
+        {{else}}
+          <tr><td colspan="5" class="py-8 text-center text-base-content/60">No users yet.</td></tr>
+        {{end}}
+      </tbody>
+    </table>
+  </div>
+
+  <form class="rounded-box border border-base-300 bg-base-100 p-4"
+    hx-post="/admin/partials/users"
+    hx-target="#users-panel"
+    hx-swap="innerHTML">
+    <h3 class="font-semibold">{{if .Edit.Username}}Edit {{.Edit.Username}}{{else}}Create User{{end}}</h3>
+    <label class="form-control mt-3">
+      <span class="label-text">Username</span>
+      <input class="input input-bordered input-sm font-mono" name="username" value="{{.Edit.Username}}" required>
+    </label>
+    <label class="form-control mt-2">
+      <span class="label-text">Password</span>
+      <input class="input input-bordered input-sm" name="password" type="password" autocomplete="new-password" placeholder="{{if .Edit.Username}}Leave blank to keep current{{else}}Required for new users{{end}}">
+    </label>
+    <label class="form-control mt-2">
+      <span class="label-text">Home</span>
+      <input class="input input-bordered input-sm font-mono" name="home" value="{{if .Edit.Home}}{{.Edit.Home}}{{else}}/{{.Edit.Username}}{{end}}" placeholder="/username">
+    </label>
+    <label class="form-control mt-2">
+      <span class="label-text">Groups</span>
+      <input class="input input-bordered input-sm" name="groups" value="{{join .Edit.Groups ", "}}" placeholder="staff, media">
+    </label>
+
+    <div class="mt-3 grid grid-cols-2 gap-2 text-sm">
+      <label class="label cursor-pointer justify-start gap-2"><input class="checkbox checkbox-sm" type="checkbox" name="perm_list" {{checked .Edit.Permissions.List}}> List</label>
+      <label class="label cursor-pointer justify-start gap-2"><input class="checkbox checkbox-sm" type="checkbox" name="perm_download" {{checked .Edit.Permissions.Download}}> Download</label>
+      <label class="label cursor-pointer justify-start gap-2"><input class="checkbox checkbox-sm" type="checkbox" name="perm_upload" {{checked .Edit.Permissions.Upload}}> Upload</label>
+      <label class="label cursor-pointer justify-start gap-2"><input class="checkbox checkbox-sm" type="checkbox" name="perm_delete" {{checked .Edit.Permissions.Delete}}> Delete</label>
+      <label class="label cursor-pointer justify-start gap-2"><input class="checkbox checkbox-sm" type="checkbox" name="perm_mkdir" {{checked .Edit.Permissions.Mkdir}}> Mkdir</label>
+      <label class="label cursor-pointer justify-start gap-2"><input class="checkbox checkbox-sm" type="checkbox" name="perm_rename" {{checked .Edit.Permissions.Rename}}> Rename</label>
+      <label class="label cursor-pointer justify-start gap-2"><input class="checkbox checkbox-sm" type="checkbox" name="perm_public" {{checked .Edit.Permissions.Public}}> Public</label>
+      <label class="label cursor-pointer justify-start gap-2"><input class="checkbox checkbox-sm" type="checkbox" name="perm_dropbox" {{checked .Edit.Permissions.Dropbox}}> Dropbox</label>
+      <label class="label cursor-pointer justify-start gap-2"><input class="checkbox checkbox-sm" type="checkbox" name="perm_admin" {{checked .Edit.Permissions.Admin}}> Admin</label>
+      <label class="label cursor-pointer justify-start gap-2"><input class="checkbox checkbox-sm" type="checkbox" name="disabled" {{checked .Edit.Disabled}}> Disabled</label>
+    </div>
+
+    <div class="mt-4 flex gap-2">
+      <button class="btn btn-primary btn-sm flex-1">Save User</button>
+      <button class="btn btn-ghost btn-sm" type="button" hx-get="/admin/partials/users" hx-target="#users-panel" hx-swap="innerHTML">New</button>
+    </div>
+  </form>
+</div>

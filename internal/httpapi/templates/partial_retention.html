@@ -1,0 +1,40 @@
+<div class="flex flex-wrap items-center justify-between gap-3">
+  <div>
+    <p class="mac-section-title">Recovery</p>
+    <h2 class="mt-1 text-lg font-semibold">Trash and Versions</h2>
+  </div>
+  <div class="join">
+    <button class="btn btn-sm join-item {{if eq .Kind "trash"}}btn-primary{{end}}" hx-get="/admin/partials/retention?kind=trash" hx-target="#retention-panel" hx-swap="innerHTML">Trash</button>
+    <button class="btn btn-sm join-item {{if eq .Kind "versions"}}btn-primary{{end}}" hx-get="/admin/partials/retention?kind=versions" hx-target="#retention-panel" hx-swap="innerHTML">Versions</button>
+  </div>
+</div>
+{{if .Status}}<div class="alert alert-success mt-3 py-2 text-sm">{{.Status}}</div>{{end}}
+{{if .Error}}<div class="alert alert-error mt-3 py-2 text-sm">{{.Error}}</div>{{end}}
+
+<div class="mt-4 max-h-80 overflow-auto rounded-box border border-base-300 bg-base-100/50 mac-scroll">
+  <table class="table table-sm table-pin-rows">
+    <thead><tr><th class="bg-base-200">Original Path</th><th class="bg-base-200">Size</th><th class="bg-base-200">Modified</th><th class="bg-base-200">Restore</th></tr></thead>
+    <tbody>
+      {{range .Items}}
+        <tr class="align-top hover:bg-base-200/70">
+          <td class="max-w-0 min-w-80 break-all font-mono text-xs">{{.OriginalPath}}</td>
+          <td class="whitespace-nowrap font-mono text-xs">{{humanSize .Size .IsDir}}</td>
+          <td class="whitespace-nowrap font-mono text-xs">{{formatDate .ModTime}}</td>
+          <td class="min-w-72">
+            <form class="grid grid-cols-[minmax(12rem,1fr)_auto_auto] items-center gap-2"
+              hx-post="/admin/partials/retention?kind={{$.Kind}}"
+              hx-target="#retention-panel"
+              hx-swap="innerHTML">
+              <input type="hidden" name="id" value="{{.ID}}">
+              <input class="input input-bordered input-xs w-full" name="dest_path" placeholder="restore path">
+              <label class="label cursor-pointer gap-1 p-0 text-xs whitespace-nowrap"><input class="checkbox checkbox-xs" type="checkbox" name="overwrite"> overwrite</label>
+              <button class="btn btn-xs">Restore</button>
+            </form>
+          </td>
+        </tr>
+      {{else}}
+        <tr><td colspan="4" class="py-8 text-center text-base-content/60">Nothing retained.</td></tr>
+      {{end}}
+    </tbody>
+  </table>
+</div>

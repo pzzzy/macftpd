@@ -1,0 +1,23 @@
+<!doctype html>
+<html lang="en" data-theme="macftpd">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>{{.Title}}</title>
+  <link rel="stylesheet" href="{{uiAsset "macftpd.css"}}">
+</head>
+<body>
+  <main class="mx-auto max-w-3xl p-5 pt-[10vh]">
+    <section class="mac-panel rounded-box p-6">
+      <h1 class="mb-4 text-2xl font-semibold">{{.Name}}</h1>
+      <dl class="grid gap-3 text-sm sm:grid-cols-[130px_1fr]">
+        <dt class="text-base-content/60">Path</dt><dd class="break-all font-mono">{{.Path}}</dd>
+        <dt class="text-base-content/60">Type</dt><dd>{{.Type}}</dd>
+        <dt class="text-base-content/60">Size</dt><dd>{{.Size}}</dd>
+        <dt class="text-base-content/60">Modified</dt><dd>{{.ModTime}}</dd>
+      </dl>
+      <a class="btn btn-primary mt-5" href="{{.Href}}">Download</a>
+    </section>
+  </main>
+</body>
+</html>

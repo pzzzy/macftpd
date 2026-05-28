@@ -477,6 +477,9 @@ func TestAdminBasicAuthSetsSessionCookie(t *testing.T) {
 
 func TestAdminFileBrowserUsesHistoryState(t *testing.T) {
 	srv := testServer(t)
+	if err := os.WriteFile(srv.root.Base+"/public/info.txt", []byte("detail"), 0o640); err != nil {
+		t.Fatal(err)
+	}
 	req := httptest.NewRequest(http.MethodGet, "/admin/?path=/public&selected=/public/info.txt", nil)
 	req.SetBasicAuth("admin", "secret")
 	rr := httptest.NewRecorder()
@@ -485,10 +488,59 @@ func TestAdminFileBrowserUsesHistoryState(t *testing.T) {
 		t.Fatalf("status = %d body=%s", rr.Code, rr.Body.String())
 	}
 	body := rr.Body.String()
-	for _, needle := range []string{"fileSearch", "history.pushState", "popstate", "Copy selected", "Activity", "uploadForm", "Share selected", "1 download", "revokeLink"} {
+	for _, needle := range []string{"htmx.min.js", "app.js", "file-workspace", "hx-get=\"/admin/partials/files", "hx-trigger=\"load", "links-panel", "activity-panel"} {
 		if !strings.Contains(body, needle) {
-			t.Fatalf("admin file browser missing %q", needle)
+			t.Fatalf("admin shell missing %q", needle)
 		}
+	}
+
+	req = httptest.NewRequest(http.MethodGet, "/admin/partials/files?path=/public&selected=/public/info.txt", nil)
+	req.SetBasicAuth("admin", "secret")
+	rr = httptest.NewRecorder()
+	srv.requireAdmin(srv.adminFilesPartial)(rr, req)
+	if rr.Code != http.StatusOK {
+		t.Fatalf("partial status = %d body=%s", rr.Code, rr.Body.String())
+	}
+	body = rr.Body.String()
+	for _, needle := range []string{"file-search", "hx-push-url", "Copy selected", "Move selected", "upload-files", "Inspector"} {
+		if !strings.Contains(body, needle) {
+			t.Fatalf("admin file partial missing %q", needle)
+		}
+	}
+	if strings.Contains(body, "%252F") {
+		t.Fatalf("admin file partial double-encoded history URL: %s", body)
+	}
+}
+
+func TestAdminPartialsRenderHTMXDashboardSections(t *testing.T) {
+	srv := testServer(t)
+	for _, tc := range []struct {
+		name    string
+		target  func(http.ResponseWriter, *http.Request, principal)
+		path    string
+		needles []string
+	}{
+		{"users", srv.adminUsersPartial, "/admin/partials/users", []string{"hx-post=\"/admin/partials/users\"", "Save User", "Accounts"}},
+		{"links", srv.adminLinksPartial, "/admin/partials/links", []string{"hx-post=\"/admin/partials/links\"", "Create Link", "Shares and Drops"}},
+		{"activity", srv.adminActivityPartial, "/admin/partials/activity", []string{"Live Feed"}},
+		{"status", srv.adminStatusPartial, "/admin/partials/status", []string{"Health", "Sessions"}},
+		{"retention", srv.adminRetentionPartial, "/admin/partials/retention?kind=trash", []string{"Trash and Versions", "Restore"}},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			req := httptest.NewRequest(http.MethodGet, tc.path, nil)
+			req.SetBasicAuth("admin", "secret")
+			rr := httptest.NewRecorder()
+			srv.requireAdmin(tc.target)(rr, req)
+			if rr.Code != http.StatusOK {
+				t.Fatalf("status = %d body=%s", rr.Code, rr.Body.String())
+			}
+			body := rr.Body.String()
+			for _, needle := range tc.needles {
+				if !strings.Contains(body, needle) {
+					t.Fatalf("partial missing %q: %s", needle, body)
+				}
+			}
+		})
 	}
 }
 

@@ -1,0 +1,64 @@
+@tailwind base;
+@tailwind components;
+@tailwind utilities;
+
+@layer base {
+  :root {
+    color-scheme: dark;
+  }
+
+  body {
+    @apply min-h-screen bg-base-100 text-base-content antialiased;
+    background-image:
+      radial-gradient(circle at 20% 0%, rgba(45, 212, 191, 0.10), transparent 28rem),
+      linear-gradient(180deg, rgba(17, 26, 36, 0.85), rgba(11, 17, 23, 1) 24rem);
+  }
+
+  button,
+  input,
+  select,
+  textarea {
+    font: inherit;
+  }
+}
+
+@layer components {
+  .mac-panel {
+    @apply border border-base-300 bg-base-200/95 shadow-sm shadow-black/20;
+  }
+
+  .mac-section-title {
+    @apply text-sm font-semibold uppercase tracking-wide text-base-content/60;
+  }
+
+  .mac-file-row {
+    @apply cursor-pointer border-b border-base-300/70 transition-colors hover:bg-base-300/40;
+  }
+
+  .mac-file-row.is-selected {
+    @apply bg-primary/15;
+  }
+
+  .mac-muted {
+    @apply text-base-content/60;
+  }
+
+  .mac-scroll {
+    scrollbar-width: thin;
+    scrollbar-color: #40566b transparent;
+  }
+
+  .htmx-indicator {
+    opacity: 0;
+    transition: opacity 120ms ease-in-out;
+  }
+
+  .htmx-request .htmx-indicator,
+  .htmx-request.htmx-indicator {
+    opacity: 1;
+  }
+
+  .drop-active {
+    @apply border-primary bg-primary/10;
+  }
+}

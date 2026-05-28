@@ -2,6 +2,7 @@
 .env
 .env.*
 .ssh/
+node_modules/
 *.local
 *.log
 *.sqlite
