@@ -31,6 +31,8 @@ var (
 	publicListingTemplate    = mustTemplate("public_listing.html")
 )
 
+const uiAssetVersion = "20260528-dark-ux"
+
 func mustTemplate(name string) *template.Template {
 	return template.Must(template.New(name).Funcs(templateFuncs()).ParseFS(uiFS, "templates/"+name))
 }
@@ -40,7 +42,11 @@ func (s *Server) staticAssets() http.Handler {
 	if err != nil {
 		return http.NotFoundHandler()
 	}
-	return http.StripPrefix("/assets/", http.FileServer(http.FS(sub)))
+	fileServer := http.StripPrefix("/assets/", http.FileServer(http.FS(sub)))
+	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Cache-Control", "no-store")
+		fileServer.ServeHTTP(w, r)
+	})
 }
 
 func templateFuncs() template.FuncMap {
@@ -115,6 +121,9 @@ func templateFuncs() template.FuncMap {
 			default:
 				return "badge-warning"
 			}
+		},
+		"uiAsset": func(name string) string {
+			return "/assets/" + strings.TrimPrefix(name, "/") + "?v=" + uiAssetVersion
 		},
 	}
 }

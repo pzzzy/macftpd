@@ -4,14 +4,14 @@
   <meta charset="utf-8">
   <meta name="viewport" content="width=device-width, initial-scale=1">
   <title>macftpd admin</title>
-  <link rel="stylesheet" href="/assets/macftpd.css">
+  <link rel="stylesheet" href="{{uiAsset "macftpd.css"}}">
   <script>
     if (location.username || location.password) {
       location.replace(location.protocol + "//" + location.host + location.pathname + location.search + location.hash);
     }
   </script>
-  <script src="/assets/htmx.min.js" defer></script>
-  <script src="/assets/app.js" defer></script>
+  <script src="{{uiAsset "htmx.min.js"}}" defer></script>
+  <script src="{{uiAsset "app.js"}}" defer></script>
 </head>
 <body>
   <div class="min-h-screen">
