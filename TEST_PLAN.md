@@ -10,6 +10,8 @@ Use this checklist against the remote Mac long-term test instance.
 - Cloudflare HTTP: `https://ftp.example.com`
 - HTTP admin: `http://example-host.local:8080/admin`
 - Public files: `http://example-host.local:8080/public/<path>`
+- Direct share links: `https://ftp.example.com/s/<id>/<token>/<filename>`
+- Upload drop links: `https://ftp.example.com/d/<id>/<token>`
 - Storage root on remote Mac: `/srv/macftpd/files`
 
 ## Operations And Monitoring
@@ -84,6 +86,11 @@ Use this checklist against the remote Mac long-term test instance.
 - `POST /api/groups` creates or updates a group.
 - `GET /api/files?path=/` lists storage entries.
 - `POST /api/upload` uploads a multipart file.
+- `POST /api/upload/chunk` uploads large admin files in chunks and assembles them atomically.
+- `POST /api/files/action` copies or moves files and folders, including copy/move into `/public`.
+- `GET /api/shares` lists active links with persisted URL paths for newly-created links.
+- `DELETE /api/shares/<id>` revokes a link before expiry.
+- `GET /api/stats?path=/public/<file>` summarizes public/share download count, last download time, recent downloads, and referrers.
 - Unauthenticated `/api/*` calls return `401`.
 
 ## Public HTTP Files
@@ -92,8 +99,20 @@ Use this checklist against the remote Mac long-term test instance.
 - Fetch it from `/public/<file>`.
 - Confirm `Cache-Control` is present.
 - Confirm `Cache-Tag` is present when Cloudflare cache tag is configured.
-- Create a share link with `POST /api/shares`, open the returned `/share/<id>/<token>` URL, and download with `?download=1`.
-- Create an upload drop link with `POST /api/shares {"kind":"upload"}`, upload a file to `/drop/<id>/<token>`, and confirm it appears in the destination folder.
+- Confirm `/public/` renders a sortable directory listing and hides ignored files such as `.DS_Store`.
+- Create a download share with `POST /api/shares`, open the returned `/s/<id>/<token>/<filename>` URL, and confirm the file is served directly.
+- Confirm images/videos/PDF/text shares open inline and archive-style shares download as attachments.
+- Confirm filenames with spaces, brackets, or non-ASCII characters are preserved in `Content-Disposition`.
+- Create a one-download share and confirm the second request returns unavailable/gone.
+- Create a never-expiring share and confirm the admin list does not show a year-1 expiry date.
+- Create a password-protected share, submit the password form, and confirm the direct file URL works after the secure cookie is set.
+- Create an upload drop link with `POST /api/shares {"kind":"upload"}`, upload a file to `/d/<id>/<token>`, and confirm it appears in the destination folder.
+- Create a password-protected drop and confirm wrong passwords re-render the password form without `bad upload`.
+- Upload a large file through the drop UI and confirm chunked upload progress completes.
+- Create a drop into `/public`, upload a file, and confirm the UI/API exposes the returned `public_url`.
+- Confirm `GET /api/shares` continues to show newly-created token URLs after page refresh.
+- Revoke a share/drop link from the admin UI and confirm the URL stops working before its original expiry.
+- Download public and shared files, then confirm `/api/stats?path=<path>` increments counts and records recent downloads/referrers.
 - Delete a file and confirm it appears in `GET /api/retention?kind=trash`; restore it with `POST /api/retention/restore`.
 - Overwrite a file and confirm a version appears in `GET /api/retention?kind=versions`.
 - Confirm `/api/status` shows active FTP sessions during a held FTP control connection.
@@ -108,6 +127,8 @@ Use this checklist against the remote Mac long-term test instance.
 - From `https://ftp.example.com/admin/`, create, edit, list, and delete a test user; saves must not fail with `cross-origin admin request denied`.
 - Confirm `https://ftp.example.com/public/` renders the sortable public directory listing.
 - Fetch the same `https://ftp.example.com/public/<file>` twice and confirm `X-Macftpd-Cache: HIT` on a repeated request.
+- Create and open a `https://ftp.example.com/s/...` direct share; confirm it bypasses admin auth and uses the correct MIME/disposition.
+- Create and use a `https://ftp.example.com/d/...` protected drop; confirm password form, cookie, chunked upload, and public URL behavior.
 - Confirm public responses include CDN cache headers.
 - Confirm `/admin/`, `/api/*`, and `/healthz` include `Cache-Control: no-store` through the Worker.
 - Confirm a write with `Origin: https://evil.example` still returns `403`.
@@ -132,5 +153,6 @@ Use this checklist against the remote Mac long-term test instance.
 - Confirm `/srv/macftpd/files` remains the storage root.
 - Reboot remote Mac and decide whether to use manual screen restart or launchd after Full Disk Access is granted.
 - Fill passive port range with multiple simultaneous downloads.
+- Confirm passive UPnP/NAT-PMP mappings are created on demand and released after data connections close.
 - Leave monitor running overnight and inspect `status=fail` lines.
 - Run `ADMIN_PASS=... HOST=192.0.2.10 ./scripts/protocol-lab.sh` for the recursive FTP compatibility suite.
