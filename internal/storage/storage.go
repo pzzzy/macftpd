@@ -316,6 +316,19 @@ func (r *Root) OpenFile(realPath string, flag int, perm fs.FileMode) (*os.File, 
 	return root.OpenFile(rel, flag, perm)
 }
 
+func (r *Root) Chmod(realPath string, mode fs.FileMode) error {
+	root, err := os.OpenRoot(r.Base)
+	if err != nil {
+		return err
+	}
+	defer root.Close()
+	rel, err := r.relFromReal(realPath)
+	if err != nil {
+		return err
+	}
+	return root.Chmod(rel, mode)
+}
+
 func (r *Root) MkdirAll(realPath string, perm fs.FileMode) error {
 	root, err := os.OpenRoot(r.Base)
 	if err != nil {

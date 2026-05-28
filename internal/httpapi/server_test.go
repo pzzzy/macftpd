@@ -6,7 +6,9 @@ import (
 	"mime/multipart"
 	"net/http"
 	"net/http/httptest"
+	"net/url"
 	"os"
+	"strconv"
 	"strings"
 	"testing"
 
@@ -185,6 +187,207 @@ func TestUploadRejectsIgnoredDestination(t *testing.T) {
 	}
 }
 
+func TestChunkedUploadAssemblesAndVersions(t *testing.T) {
+	srv := testServer(t)
+	if err := os.WriteFile(srv.root.Base+"/public/movie.mp4", []byte("old"), 0o640); err != nil {
+		t.Fatal(err)
+	}
+	chunks := []struct {
+		offset int64
+		data   string
+	}{
+		{0, "hello "},
+		{6, "world"},
+	}
+	for _, chunk := range chunks {
+		var body bytes.Buffer
+		mw := multipart.NewWriter(&body)
+		fields := map[string]string{
+			"path":       "/public",
+			"filename":   "[1997-06-28] Glastonbury.MP4",
+			"upload_id":  "upload-test-1234",
+			"offset":     strconv.FormatInt(chunk.offset, 10),
+			"total_size": "11",
+		}
+		for k, v := range fields {
+			if err := mw.WriteField(k, v); err != nil {
+				t.Fatal(err)
+			}
+		}
+		part, err := mw.CreateFormFile("chunk", "[1997-06-28] Glastonbury.MP4")
+		if err != nil {
+			t.Fatal(err)
+		}
+		if _, err := part.Write([]byte(chunk.data)); err != nil {
+			t.Fatal(err)
+		}
+		if err := mw.Close(); err != nil {
+			t.Fatal(err)
+		}
+		req := httptest.NewRequest(http.MethodPost, "/api/upload/chunk", &body)
+		req.SetBasicAuth("admin", "secret")
+		req.Header.Set("Content-Type", mw.FormDataContentType())
+		rr := httptest.NewRecorder()
+		srv.requireAdmin(srv.uploadChunk)(rr, req)
+		if rr.Code != http.StatusOK {
+			t.Fatalf("chunk offset %d status = %d body=%s", chunk.offset, rr.Code, rr.Body.String())
+		}
+	}
+	raw, err := os.ReadFile(srv.root.Base + "/public/[1997-06-28] Glastonbury.MP4")
+	if err != nil || string(raw) != "hello world" {
+		t.Fatalf("assembled payload=%q err=%v", string(raw), err)
+	}
+	if _, err := os.Stat(srv.root.Base + "/._macftpd_uploads/upload-test-1234.part"); !os.IsNotExist(err) {
+		t.Fatalf("part file was not removed, err=%v", err)
+	}
+}
+
+func TestShareLinkServesBareFileWithStatsAndExpiry(t *testing.T) {
+	srv := testServer(t)
+	name := "[1997-06-28] Glastonbury.MP4"
+	if err := os.WriteFile(srv.root.Base+"/public/"+name, []byte("video"), 0o640); err != nil {
+		t.Fatal(err)
+	}
+	created, err := srv.links.Create(share.CreateRequest{Kind: share.KindDownload, Path: "/public/" + name, CreatedBy: "admin", MaxDownloads: 1})
+	if err != nil {
+		t.Fatal(err)
+	}
+	sharePath := "/s/" + created.Link.ID + "/" + created.Token + "/" + url.PathEscape(name)
+	req := httptest.NewRequest(http.MethodGet, sharePath, nil)
+	req.Header.Set("Referer", "https://example.test/page")
+	rr := httptest.NewRecorder()
+	srv.shareLink(rr, req)
+	if rr.Code != http.StatusOK || rr.Body.String() != "video" {
+		t.Fatalf("share status=%d body=%q", rr.Code, rr.Body.String())
+	}
+	if got := rr.Header().Get("Content-Disposition"); !strings.Contains(got, "inline") || !strings.Contains(got, "filename*=") {
+		t.Fatalf("bad disposition %q", got)
+	}
+	req = httptest.NewRequest(http.MethodGet, sharePath, nil)
+	rr = httptest.NewRecorder()
+	srv.shareLink(rr, req)
+	if rr.Code != http.StatusGone {
+		t.Fatalf("one-download link should be gone, got %d", rr.Code)
+	}
+	stats := srv.activity.StatsForPath("/public/"+name, 10)
+	if stats.Downloads != 1 || stats.Referrers["https://example.test/page"] != 1 {
+		t.Fatalf("bad stats %#v", stats)
+	}
+}
+
+func TestDropLinkSupportsChunkedUpload(t *testing.T) {
+	srv := testServer(t)
+	created, err := srv.links.Create(share.CreateRequest{Kind: share.KindUpload, Path: "/public", CreatedBy: "admin", AllowOverwrite: true})
+	if err != nil {
+		t.Fatal(err)
+	}
+	chunks := []struct {
+		offset int64
+		data   string
+	}{
+		{0, "drop "},
+		{5, "payload"},
+	}
+	for _, chunk := range chunks {
+		var body bytes.Buffer
+		mw := multipart.NewWriter(&body)
+		fields := map[string]string{
+			"filename":   "upload.zip",
+			"upload_id":  "drop-test-1234",
+			"offset":     strconv.FormatInt(chunk.offset, 10),
+			"total_size": "12",
+		}
+		for k, v := range fields {
+			if err := mw.WriteField(k, v); err != nil {
+				t.Fatal(err)
+			}
+		}
+		part, err := mw.CreateFormFile("chunk", "upload.zip")
+		if err != nil {
+			t.Fatal(err)
+		}
+		if _, err := part.Write([]byte(chunk.data)); err != nil {
+			t.Fatal(err)
+		}
+		if err := mw.Close(); err != nil {
+			t.Fatal(err)
+		}
+		req := httptest.NewRequest(http.MethodPost, "/d/"+created.Link.ID+"/"+created.Token, &body)
+		req.Header.Set("Content-Type", mw.FormDataContentType())
+		rr := httptest.NewRecorder()
+		srv.dropLink(rr, req)
+		if rr.Code != http.StatusOK {
+			t.Fatalf("chunk offset %d status=%d body=%s", chunk.offset, rr.Code, rr.Body.String())
+		}
+	}
+	raw, err := os.ReadFile(srv.root.Base + "/public/upload.zip")
+	if err != nil || string(raw) != "drop payload" {
+		t.Fatalf("drop payload=%q err=%v", string(raw), err)
+	}
+}
+
+func TestPasswordProtectedDropPasswordFormSetsCookie(t *testing.T) {
+	srv := testServer(t)
+	created, err := srv.links.Create(share.CreateRequest{Kind: share.KindUpload, Path: "/public", CreatedBy: "admin", Password: "correct", AllowOverwrite: true})
+	if err != nil {
+		t.Fatal(err)
+	}
+	req := httptest.NewRequest(http.MethodPost, "/d/"+created.Link.ID+"/"+created.Token, strings.NewReader("password=wrong"))
+	req.Header.Set("Content-Type", "application/x-www-form-urlencoded")
+	rr := httptest.NewRecorder()
+	srv.dropLink(rr, req)
+	if rr.Code == http.StatusBadRequest || strings.Contains(rr.Body.String(), "bad upload") {
+		t.Fatalf("password form was parsed as upload: status=%d body=%s", rr.Code, rr.Body.String())
+	}
+	if rr.Code != http.StatusOK || !strings.Contains(rr.Body.String(), "Protected drop") {
+		t.Fatalf("wrong password status=%d body=%s", rr.Code, rr.Body.String())
+	}
+
+	req = httptest.NewRequest(http.MethodPost, "/d/"+created.Link.ID+"/"+created.Token, strings.NewReader("password=correct"))
+	req.Header.Set("Content-Type", "application/x-www-form-urlencoded")
+	req.Header.Set("X-Forwarded-Proto", "https")
+	rr = httptest.NewRecorder()
+	srv.dropLink(rr, req)
+	if rr.Code != http.StatusSeeOther {
+		t.Fatalf("correct password status=%d body=%s", rr.Code, rr.Body.String())
+	}
+	if rr.Header().Get("Set-Cookie") == "" {
+		t.Fatal("password form did not set share cookie")
+	}
+}
+
+func TestSharesAPIListIncludesPersistentURLAndNeverOmittedExpiry(t *testing.T) {
+	srv := testServer(t)
+	if err := os.WriteFile(srv.root.Base+"/public/keep.txt", []byte("keep"), 0o640); err != nil {
+		t.Fatal(err)
+	}
+	req := httptest.NewRequest(http.MethodPost, "/api/shares", strings.NewReader(`{"kind":"download","path":"/public/keep.txt","expires_in":"never"}`))
+	req.SetBasicAuth("admin", "secret")
+	req.Header.Set("Content-Type", "application/json")
+	rr := httptest.NewRecorder()
+	srv.requireAdmin(srv.sharesAPI)(rr, req)
+	if rr.Code != http.StatusOK {
+		t.Fatalf("create status=%d body=%s", rr.Code, rr.Body.String())
+	}
+	req = httptest.NewRequest(http.MethodGet, "/api/shares", nil)
+	req.SetBasicAuth("admin", "secret")
+	rr = httptest.NewRecorder()
+	srv.requireAdmin(srv.sharesAPI)(rr, req)
+	if rr.Code != http.StatusOK {
+		t.Fatalf("list status=%d body=%s", rr.Code, rr.Body.String())
+	}
+	body := rr.Body.String()
+	if !strings.Contains(body, `"url_path":"/s/`) {
+		t.Fatalf("share list missing url_path: %s", body)
+	}
+	if !strings.Contains(body, `"download_count":0`) {
+		t.Fatalf("share list missing zero download_count: %s", body)
+	}
+	if strings.Contains(body, `"expires_at"`) {
+		t.Fatalf("never-expiring share exposed zero expiry: %s", body)
+	}
+}
+
 func TestUsersAPIRejectsPasswordHashMassAssignment(t *testing.T) {
 	srv := testServer(t)
 	body := strings.NewReader(`{"username":"hashonly","password_hash":"pbkdf2-sha256$1$bad$bad","home":"/hashonly","permissions":{"list":true}}`)
@@ -282,7 +485,7 @@ func TestAdminFileBrowserUsesHistoryState(t *testing.T) {
 		t.Fatalf("status = %d body=%s", rr.Code, rr.Body.String())
 	}
 	body := rr.Body.String()
-	for _, needle := range []string{"fileSearch", "history.pushState", "popstate", "Copy selected", "Activity", "uploadForm"} {
+	for _, needle := range []string{"fileSearch", "history.pushState", "popstate", "Copy selected", "Activity", "uploadForm", "Share selected", "1 download", "revokeLink"} {
 		if !strings.Contains(body, needle) {
 			t.Fatalf("admin file browser missing %q", needle)
 		}

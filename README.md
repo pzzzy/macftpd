@@ -129,6 +129,18 @@ Deletes move files into `._macftpd_trash`, and overwrites create retained versio
 
 Keep `ftp.allow_fxp` disabled unless you explicitly trust server-to-server active FTP targets. The HTTP `/api/fxp` endpoint performs authenticated remote FTP pulls into local storage and is admin-only.
 
+## FTPS Certificates
+
+macftpd supports optional explicit FTPS when `ftp.tls_cert_file` and `ftp.tls_key_file` are configured. A free Let's Encrypt certificate can be renewed with:
+
+```bash
+MACFTPD_APP_DIR=/opt/macftpd \
+MACFTPD_ACME_DOMAIN=ftp.example.com \
+/opt/macftpd/bin/renew-ftps-cert.sh
+```
+
+The renewal helper uses Certbot's `renew` flow when a lineage already exists, serves HTTP-01 challenge files from `/public/.well-known/acme-challenge/`, installs renewed certs through a deploy hook, and restarts the running macftpd process so the new certificate is presented. The example LaunchAgent `launchd/com.example.macftpd.cert-renew.plist` runs renewal checks twice daily with jitter.
+
 ## macOS File Access
 
 The launchd service runs as the target login user, so macOS privacy and external-volume permissions apply to that user. If the service cannot see `/srv/macftpd/files`, grant the hosting terminal/app Full Disk Access or run the first launch interactively once from Terminal:

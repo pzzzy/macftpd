@@ -29,12 +29,14 @@ type Link struct {
 	ID             string    `json:"id"`
 	Kind           Kind      `json:"kind"`
 	Path           string    `json:"path"`
+	URLPath        string    `json:"url_path,omitempty"`
 	Label          string    `json:"label,omitempty"`
 	CreatedBy      string    `json:"created_by"`
 	CreatedAt      time.Time `json:"created_at"`
 	ExpiresAt      time.Time `json:"expires_at,omitempty"`
 	MaxDownloads   int       `json:"max_downloads,omitempty"`
-	DownloadCount  int       `json:"download_count,omitempty"`
+	DownloadCount  int       `json:"download_count"`
+	LastDownloadAt time.Time `json:"last_download_at,omitempty"`
 	TokenHash      string    `json:"token_hash"`
 	PasswordHash   string    `json:"password_hash,omitempty"`
 	AllowOverwrite bool      `json:"allow_overwrite,omitempty"`
@@ -42,18 +44,20 @@ type Link struct {
 }
 
 type PublicLink struct {
-	ID             string    `json:"id"`
-	Kind           Kind      `json:"kind"`
-	Path           string    `json:"path"`
-	Label          string    `json:"label,omitempty"`
-	CreatedBy      string    `json:"created_by"`
-	CreatedAt      time.Time `json:"created_at"`
-	ExpiresAt      time.Time `json:"expires_at,omitempty"`
-	MaxDownloads   int       `json:"max_downloads,omitempty"`
-	DownloadCount  int       `json:"download_count,omitempty"`
-	HasPassword    bool      `json:"has_password"`
-	AllowOverwrite bool      `json:"allow_overwrite,omitempty"`
-	Disabled       bool      `json:"disabled,omitempty"`
+	ID             string     `json:"id"`
+	Kind           Kind       `json:"kind"`
+	Path           string     `json:"path"`
+	URLPath        string     `json:"url_path,omitempty"`
+	Label          string     `json:"label,omitempty"`
+	CreatedBy      string     `json:"created_by"`
+	CreatedAt      time.Time  `json:"created_at"`
+	ExpiresAt      *time.Time `json:"expires_at,omitempty"`
+	MaxDownloads   int        `json:"max_downloads,omitempty"`
+	DownloadCount  int        `json:"download_count"`
+	LastDownloadAt *time.Time `json:"last_download_at,omitempty"`
+	HasPassword    bool       `json:"has_password"`
+	AllowOverwrite bool       `json:"allow_overwrite,omitempty"`
+	Disabled       bool       `json:"disabled,omitempty"`
 }
 
 type CreateRequest struct {
@@ -136,11 +140,28 @@ func (s *Store) Create(req CreateRequest) (Created, error) {
 		}
 		link.ID = id
 	}
+	if req.Kind == KindUpload {
+		link.URLPath = "/d/" + link.ID + "/" + token
+	} else {
+		link.URLPath = "/s/" + link.ID + "/" + token
+	}
 	s.links[link.ID] = link
 	if err := s.saveLocked(); err != nil {
 		return Created{}, err
 	}
 	return Created{Link: public(link), Token: token}, nil
+}
+
+func (s *Store) SetURLPath(id, urlPath string) error {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	link, ok := s.links[id]
+	if !ok {
+		return ErrNotFound
+	}
+	link.URLPath = urlPath
+	s.links[id] = link
+	return s.saveLocked()
 }
 
 func (s *Store) List() []PublicLink {
@@ -181,7 +202,20 @@ func (s *Store) Verify(id, token, password string) (PublicLink, error) {
 	if !ok {
 		return PublicLink{}, ErrNotFound
 	}
-	if err := validate(link, token, password); err != nil {
+	if err := validate(link, token, password, false); err != nil {
+		return PublicLink{}, err
+	}
+	return public(link), nil
+}
+
+func (s *Store) VerifyAuthorized(id, token string) (PublicLink, error) {
+	s.mu.RLock()
+	link, ok := s.links[id]
+	s.mu.RUnlock()
+	if !ok {
+		return PublicLink{}, ErrNotFound
+	}
+	if err := validate(link, token, "", true); err != nil {
 		return PublicLink{}, err
 	}
 	return public(link), nil
@@ -195,11 +229,12 @@ func (s *Store) RecordDownload(id string) error {
 		return ErrNotFound
 	}
 	link.DownloadCount++
+	link.LastDownloadAt = time.Now().UTC()
 	s.links[id] = link
 	return s.saveLocked()
 }
 
-func validate(link Link, token, password string) error {
+func validate(link Link, token, password string, passwordAlreadyVerified bool) error {
 	if link.Disabled {
 		return ErrDisabled
 	}
@@ -212,27 +247,36 @@ func validate(link Link, token, password string) error {
 	if subtle.ConstantTimeCompare([]byte(hashToken(token)), []byte(link.TokenHash)) != 1 {
 		return ErrDenied
 	}
-	if link.PasswordHash != "" && !auth.VerifyPassword(link.PasswordHash, password) {
+	if link.PasswordHash != "" && !passwordAlreadyVerified && !auth.VerifyPassword(link.PasswordHash, password) {
 		return ErrDenied
 	}
 	return nil
 }
 
 func public(link Link) PublicLink {
-	return PublicLink{
+	out := PublicLink{
 		ID:             link.ID,
 		Kind:           link.Kind,
 		Path:           link.Path,
+		URLPath:        link.URLPath,
 		Label:          link.Label,
 		CreatedBy:      link.CreatedBy,
 		CreatedAt:      link.CreatedAt,
-		ExpiresAt:      link.ExpiresAt,
 		MaxDownloads:   link.MaxDownloads,
 		DownloadCount:  link.DownloadCount,
 		HasPassword:    link.PasswordHash != "",
 		AllowOverwrite: link.AllowOverwrite,
 		Disabled:       link.Disabled,
 	}
+	if !link.ExpiresAt.IsZero() {
+		expiresAt := link.ExpiresAt
+		out.ExpiresAt = &expiresAt
+	}
+	if !link.LastDownloadAt.IsZero() {
+		lastDownloadAt := link.LastDownloadAt
+		out.LastDownloadAt = &lastDownloadAt
+	}
+	return out
 }
 
 func (s *Store) load() error {
