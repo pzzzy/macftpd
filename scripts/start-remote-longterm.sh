@@ -54,7 +54,7 @@ done
 launchctl bootout "gui/$(id -u)/com.example.macftpd" >/dev/null 2>&1 || true
 pkill -x macftpd >/dev/null 2>&1 || true
 pkill -f "${REMOTE_DIR}/bin/monitor.sh" >/dev/null 2>&1 || true
-pgrep -f "macftpd.screen.log" | while read -r pid; do
+(pgrep -f "macftpd.screen.log" || true) | while read -r pid; do
   [[ "${pid}" == "$$" ]] && continue
   kill "${pid}" >/dev/null 2>&1 || true
 done
