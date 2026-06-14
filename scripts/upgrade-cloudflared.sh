@@ -1,0 +1,53 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+VERSION="${VERSION:-2026.6.0}"
+REMOTE="${REMOTE:-}"
+KEY="${KEY:-}"
+REMOTE_DIR="${REMOTE_DIR:-/opt/macftpd}"
+INSTALL_PATH="${INSTALL_PATH:-${REMOTE_DIR}/bin/cloudflared}"
+EXPECTED_BINARY_SHA256_DARWIN_ARM64="${EXPECTED_BINARY_SHA256_DARWIN_ARM64:-1b66920a280235b0180e935c6fb2adcf91fceeeaf66c4365e606bd37d6c587ef}"
+ASSET="cloudflared-darwin-arm64.tgz"
+URL="https://github.com/cloudflare/cloudflared/releases/download/${VERSION}/${ASSET}"
+SSH_OPTS=()
+if [[ -n "${KEY}" ]]; then
+  SSH_OPTS=(-i "${KEY}")
+fi
+
+tmpdir="$(mktemp -d)"
+trap 'rm -rf "${tmpdir}"' EXIT
+
+archive="${tmpdir}/${ASSET}"
+curl -fL --retry 3 --connect-timeout 15 -o "${archive}" "${URL}"
+tar -xzf "${archive}" -C "${tmpdir}"
+binary="$(find "${tmpdir}" -type f -name cloudflared | head -1)"
+if [[ -z "${binary}" ]]; then
+  echo "cloudflared binary not found in ${ASSET}" >&2
+  exit 1
+fi
+actual="$(shasum -a 256 "${binary}" | awk '{print $1}')"
+if [[ "${actual}" != "${EXPECTED_BINARY_SHA256_DARWIN_ARM64}" ]]; then
+  echo "checksum mismatch for extracted cloudflared: got ${actual}, expected ${EXPECTED_BINARY_SHA256_DARWIN_ARM64}" >&2
+  exit 1
+fi
+chmod 755 "${binary}"
+"${binary}" --version
+
+if [[ -n "${REMOTE}" ]]; then
+  ssh "${SSH_OPTS[@]}" "${REMOTE}" "mkdir -p '${REMOTE_DIR}/bin'"
+  scp "${SSH_OPTS[@]}" "${binary}" "${REMOTE}:${REMOTE_DIR}/bin/cloudflared.new"
+  ssh "${SSH_OPTS[@]}" "${REMOTE}" "REMOTE_DIR='${REMOTE_DIR}' bash -s" <<'SH'
+set -euo pipefail
+chmod 755 "${REMOTE_DIR}/bin/cloudflared.new"
+mv "${REMOTE_DIR}/bin/cloudflared.new" "${REMOTE_DIR}/bin/cloudflared"
+"${REMOTE_DIR}/bin/cloudflared" --version
+if launchctl print "gui/$(id -u)/com.example.macftpd-cloudflared" >/dev/null 2>&1; then
+  launchctl kickstart -k "gui/$(id -u)/com.example.macftpd-cloudflared"
+fi
+SH
+else
+  mkdir -p "$(dirname "${INSTALL_PATH}")"
+  cp "${binary}" "${INSTALL_PATH}.new"
+  chmod 755 "${INSTALL_PATH}.new"
+  mv "${INSTALL_PATH}.new" "${INSTALL_PATH}"
+fi

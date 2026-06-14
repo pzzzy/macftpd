@@ -92,6 +92,9 @@ set -euo pipefail
 REMOTE_DIR="${REMOTE_DIR:-/opt/macftpd}"
 chmod 755 "${REMOTE_DIR}/bin/macftpd.new"
 mv "${REMOTE_DIR}/bin/macftpd.new" "${REMOTE_DIR}/bin/macftpd"
+if command -v codesign >/dev/null 2>&1; then
+  codesign --force --sign - --identifier org.rememe.macftpd "${REMOTE_DIR}/bin/macftpd"
+fi
 if [[ ! -f "${REMOTE_DIR}/config.json" ]]; then
   mv "${REMOTE_DIR}/config.json.new" "${REMOTE_DIR}/config.json"
 else

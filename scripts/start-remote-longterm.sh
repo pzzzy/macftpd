@@ -24,7 +24,7 @@ if [[ -z "${ADMIN_PASS}" ]]; then
   exit 2
 fi
 
-scp "${SSH_OPTS[@]}" scripts/monitor.sh "${REMOTE}:${REMOTE_DIR}/bin/monitor.sh"
+scp "${SSH_OPTS[@]}" scripts/monitor.sh scripts/rotate-logs.sh scripts/weekly-report.sh "${REMOTE}:${REMOTE_DIR}/bin/"
 
 if [[ -z "${HOST}" ]]; then
   HOST="$(ssh "${SSH_OPTS[@]}" -o BatchMode=yes -o ConnectTimeout=5 "${REMOTE}" "ipconfig getifaddr en0 || ipconfig getifaddr en1 || ifconfig | awk '/inet / && !/127.0.0.1/ {print \\\$2; exit}'" 2>/dev/null || true)"
@@ -39,7 +39,7 @@ set -euo pipefail
 
 mkdir -p "${REMOTE_DIR}/var"
 chmod 700 "${REMOTE_DIR}/var"
-chmod 755 "${REMOTE_DIR}/bin/monitor.sh"
+chmod 755 "${REMOTE_DIR}/bin/monitor.sh" "${REMOTE_DIR}/bin/rotate-logs.sh" "${REMOTE_DIR}/bin/weekly-report.sh"
 
 cat >"${REMOTE_DIR}/var/monitor.env" <<ENV
 ADMIN_PASS='${ADMIN_PASS}'
@@ -60,6 +60,8 @@ pkill -f "${REMOTE_DIR}/bin/monitor.sh" >/dev/null 2>&1 || true
   kill "${pid}" >/dev/null 2>&1 || true
 done
 launchctl bootout "gui/$(id -u)/com.example.macftpd-monitor" >/dev/null 2>&1 || true
+launchctl bootout "gui/$(id -u)/com.example.macftpd-logrotate" >/dev/null 2>&1 || true
+launchctl bootout "gui/$(id -u)/com.example.macftpd-weekly-report" >/dev/null 2>&1 || true
 sleep 1
 
 if [[ "${START_MODE}" == "launchd" ]]; then
@@ -134,12 +136,92 @@ EOF
 </dict>
 </plist>
 EOF
-  for plist in "${HOME}/Library/LaunchAgents/com.example.macftpd.plist" "${HOME}/Library/LaunchAgents/com.example.macftpd-monitor.plist"; do
+  cat >"${HOME}/Library/LaunchAgents/com.example.macftpd-logrotate.plist" <<EOF
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "https://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+  <key>Label</key>
+  <string>com.example.macftpd-logrotate</string>
+  <key>ProgramArguments</key>
+  <array>
+    <string>${REMOTE_DIR}/bin/rotate-logs.sh</string>
+  </array>
+  <key>WorkingDirectory</key>
+  <string>${REMOTE_DIR}</string>
+  <key>StartCalendarInterval</key>
+  <dict>
+    <key>Hour</key>
+    <integer>2</integer>
+    <key>Minute</key>
+    <integer>37</integer>
+  </dict>
+  <key>StandardOutPath</key>
+  <string>${REMOTE_DIR}/var/logrotate.launchd.log</string>
+  <key>StandardErrorPath</key>
+  <string>${REMOTE_DIR}/var/logrotate.launchd.err.log</string>
+  <key>EnvironmentVariables</key>
+  <dict>
+    <key>APP_DIR</key>
+    <string>${REMOTE_DIR}</string>
+    <key>MAX_BYTES</key>
+    <string>5242880</string>
+    <key>RETENTION_DAYS</key>
+    <string>45</string>
+    <key>PATH</key>
+    <string>/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin:/usr/sbin:/sbin</string>
+  </dict>
+</dict>
+</plist>
+EOF
+  cat >"${HOME}/Library/LaunchAgents/com.example.macftpd-weekly-report.plist" <<EOF
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "https://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+  <key>Label</key>
+  <string>com.example.macftpd-weekly-report</string>
+  <key>ProgramArguments</key>
+  <array>
+    <string>${REMOTE_DIR}/bin/weekly-report.sh</string>
+  </array>
+  <key>WorkingDirectory</key>
+  <string>${REMOTE_DIR}</string>
+  <key>StartCalendarInterval</key>
+  <dict>
+    <key>Weekday</key>
+    <integer>0</integer>
+    <key>Hour</key>
+    <integer>3</integer>
+    <key>Minute</key>
+    <integer>12</integer>
+  </dict>
+  <key>StandardOutPath</key>
+  <string>${REMOTE_DIR}/var/weekly-report.launchd.log</string>
+  <key>StandardErrorPath</key>
+  <string>${REMOTE_DIR}/var/weekly-report.launchd.err.log</string>
+  <key>EnvironmentVariables</key>
+  <dict>
+    <key>APP_DIR</key>
+    <string>${REMOTE_DIR}</string>
+    <key>HOST</key>
+    <string>${HOST}</string>
+    <key>WINDOW_DAYS</key>
+    <string>7</string>
+    <key>PATH</key>
+    <string>/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin:/usr/sbin:/sbin</string>
+  </dict>
+</dict>
+</plist>
+EOF
+  for plist in "${HOME}/Library/LaunchAgents/com.example.macftpd.plist" "${HOME}/Library/LaunchAgents/com.example.macftpd-monitor.plist" "${HOME}/Library/LaunchAgents/com.example.macftpd-logrotate.plist" "${HOME}/Library/LaunchAgents/com.example.macftpd-weekly-report.plist"; do
     plutil -lint "${plist}"
     launchctl bootstrap "gui/$(id -u)" "${plist}"
   done
   launchctl kickstart -k "gui/$(id -u)/com.example.macftpd"
   launchctl kickstart -k "gui/$(id -u)/com.example.macftpd-monitor"
+  launchctl kickstart -k "gui/$(id -u)/com.example.macftpd-logrotate" || true
+  launchctl kickstart -k "gui/$(id -u)/com.example.macftpd-weekly-report" || true
 else
   screen -dmS "${SERVER_SESSION}" bash -lc "
     cd '${REMOTE_DIR}'
@@ -163,6 +245,8 @@ sleep 2
 screen -ls || true
 launchctl print "gui/$(id -u)/com.example.macftpd" 2>/dev/null | sed -n '1,60p' || true
 launchctl print "gui/$(id -u)/com.example.macftpd-monitor" 2>/dev/null | sed -n '1,60p' || true
+launchctl print "gui/$(id -u)/com.example.macftpd-logrotate" 2>/dev/null | sed -n '1,45p' || true
+launchctl print "gui/$(id -u)/com.example.macftpd-weekly-report" 2>/dev/null | sed -n '1,45p' || true
 pgrep -lf macftpd || true
 tail -20 "${REMOTE_DIR}/var/macftpd.launchd.err.log" 2>/dev/null || tail -20 "${REMOTE_DIR}/var/macftpd.screen.log" || true
 tail -40 "${REMOTE_DIR}/var/monitor.log" || true
