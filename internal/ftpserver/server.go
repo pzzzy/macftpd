@@ -26,26 +26,36 @@ import (
 )
 
 type Server struct {
-	cfg        config.FTPConfig
-	auth       *auth.Store
-	root       *storage.Root
-	ports      []int
-	portMu     sync.Mutex
-	nextPort   int
-	addrMu     sync.RWMutex
-	listener   net.Listener
-	localAddr  string
-	externalMu sync.RWMutex
-	externalIP string
-	natMu      sync.Mutex
-	natGateway string
-	upnpMu     sync.Mutex
-	upnpClient *upnpigd.Client
-	limiter    *ratelimit.Limiter
-	activity   *activity.Store
-	tracker    *status.Tracker
-	tlsConfig  *tls.Config
+	cfg         config.FTPConfig
+	auth        *auth.Store
+	root        *storage.Root
+	ports       []int
+	portMu      sync.Mutex
+	nextPort    int
+	addrMu      sync.RWMutex
+	listener    net.Listener
+	localAddr   string
+	externalMu  sync.RWMutex
+	externalIP  string
+	natMu       sync.Mutex
+	natGateway  string
+	upnpMu      sync.Mutex
+	upnpClient  *upnpigd.Client
+	limiter     *ratelimit.Limiter
+	activity    *activity.Store
+	tracker     *status.Tracker
+	tlsConfig   *tls.Config
+	readNoiseMu sync.Mutex
+	readNoise   map[string]readNoiseEvent
 }
+
+type readNoiseEvent struct {
+	count   int
+	last    time.Time
+	nextLog time.Time
+}
+
+const readNoiseReportInterval = 10 * time.Minute
 
 type session struct {
 	server        *Server
@@ -85,7 +95,7 @@ func New(cfg config.FTPConfig, store *auth.Store, root *storage.Root, activityLo
 		}
 		tlsConfig = &tls.Config{Certificates: []tls.Certificate{cert}, MinVersion: tls.VersionTLS12}
 	}
-	return &Server{cfg: cfg, auth: store, root: root, ports: ports, limiter: ratelimit.New(5, 10*time.Minute, 5*time.Minute), activity: activityLog, tracker: tracker, tlsConfig: tlsConfig}, nil
+	return &Server{cfg: cfg, auth: store, root: root, ports: ports, limiter: ratelimit.New(5, 10*time.Minute, 5*time.Minute), activity: activityLog, tracker: tracker, tlsConfig: tlsConfig, readNoise: make(map[string]readNoiseEvent)}, nil
 }
 
 func (s *Server) ListenAndServe(ctx context.Context) error {
@@ -140,6 +150,79 @@ func (s *Server) Addr() string {
 	return s.localAddr
 }
 
+func (s *Server) logReadError(addr net.Addr, err error) {
+	kind, noisy := classifyReadError(err)
+	if !noisy {
+		log.Printf("ftp read %s: %v", addr, err)
+		return
+	}
+	remote := remoteHost(addr)
+	key := remote + "\t" + kind
+	now := time.Now()
+	s.readNoiseMu.Lock()
+	if s.readNoise == nil {
+		s.readNoise = make(map[string]readNoiseEvent)
+	}
+	event := s.readNoise[key]
+	event.count++
+	event.last = now
+	if event.nextLog.IsZero() {
+		event.nextLog = now.Add(readNoiseReportInterval)
+	}
+	if len(s.readNoise) > 1000 {
+		for k, v := range s.readNoise {
+			if now.Sub(v.last) > time.Hour {
+				delete(s.readNoise, k)
+			}
+		}
+	}
+	if event.count == 1 {
+		s.readNoise[key] = event
+		s.readNoiseMu.Unlock()
+		log.Printf("ftp read remote=%s error=%s", remote, kind)
+		return
+	}
+	if !now.Before(event.nextLog) {
+		suppressed := event.count - 1
+		event.count = 1
+		event.nextLog = now.Add(readNoiseReportInterval)
+		s.readNoise[key] = event
+		s.readNoiseMu.Unlock()
+		log.Printf("ftp read noise remote=%s error=%s suppressed=%d window=%s", remote, kind, suppressed, readNoiseReportInterval)
+		return
+	}
+	s.readNoise[key] = event
+	s.readNoiseMu.Unlock()
+}
+
+func classifyReadError(err error) (string, bool) {
+	if err == nil {
+		return "", true
+	}
+	text := strings.ToLower(err.Error())
+	switch {
+	case errors.Is(err, net.ErrClosed), strings.Contains(text, "use of closed network connection"):
+		return "closed_connection", true
+	case strings.Contains(text, "connection reset by peer"):
+		return "connection_reset", true
+	case errors.Is(err, os.ErrDeadlineExceeded), strings.Contains(text, "i/o timeout"):
+		return "timeout", true
+	default:
+		return "", false
+	}
+}
+
+func remoteHost(addr net.Addr) string {
+	if addr == nil {
+		return "unknown"
+	}
+	host, _, err := net.SplitHostPort(addr.String())
+	if err != nil {
+		return addr.String()
+	}
+	return host
+}
+
 func (s *Server) handle(conn net.Conn) {
 	idle := s.cfg.IdleTimeout.Std(10 * time.Minute)
 	statusID := int64(0)
@@ -154,7 +237,7 @@ func (s *Server) handle(conn net.Conn) {
 		line, err := ss.reader.ReadString('\n')
 		if err != nil {
 			if !errors.Is(err, io.EOF) {
-				log.Printf("ftp read %s: %v", conn.RemoteAddr(), err)
+				s.logReadError(conn.RemoteAddr(), err)
 			}
 			return
 		}
@@ -415,14 +498,11 @@ func (s *session) list(arg string, namesOnly bool) {
 		s.reply(550, "Path unavailable")
 		return
 	}
-	conn, err := s.openData()
-	if err != nil {
-		s.reply(425, "Cannot open data connection")
+	conn, ok := s.beginDataTransfer()
+	if !ok {
 		return
 	}
 	defer conn.Close()
-	s.setDataDeadline(conn)
-	s.reply(150, "Opening data connection")
 	w := bufio.NewWriter(conn)
 	if info.IsDir() {
 		entries, err := s.server.root.ListForUser(s.user, realPath, virtual)
@@ -457,14 +537,11 @@ func (s *session) mlsd(arg string) {
 		s.reply(550, "Path unavailable")
 		return
 	}
-	conn, err := s.openData()
-	if err != nil {
-		s.reply(425, "Cannot open data connection")
+	conn, ok := s.beginDataTransfer()
+	if !ok {
 		return
 	}
 	defer conn.Close()
-	s.setDataDeadline(conn)
-	s.reply(150, "Opening data connection")
 	w := bufio.NewWriter(conn)
 	if info.IsDir() {
 		entries, err := s.server.root.ListForUser(s.user, realPath, virtual)
@@ -530,20 +607,17 @@ func (s *session) retrieve(arg string) {
 			return
 		}
 	}
-	conn, err := s.openData()
-	if err != nil {
-		s.reply(425, "Cannot open data connection")
+	conn, ok := s.beginDataTransfer()
+	if !ok {
 		return
 	}
 	defer conn.Close()
-	s.setDataDeadline(conn)
 	s.updateStatus(func(st *status.Session) {
 		st.Action = "download"
 		st.Path = virtual
 		st.Mode = "retr"
 		st.Bytes = 0
 	})
-	s.reply(150, "Opening data connection")
 	n, err := io.Copy(conn, file)
 	s.updateStatus(func(st *status.Session) {
 		st.Action = "idle"
@@ -625,20 +699,17 @@ func (s *session) store(arg string, appendMode bool) {
 			return
 		}
 	}
-	conn, err := s.openData()
-	if err != nil {
-		s.reply(425, "Cannot open data connection")
+	conn, ok := s.beginDataTransfer()
+	if !ok {
 		return
 	}
 	defer conn.Close()
-	s.setDataDeadline(conn)
 	s.updateStatus(func(st *status.Session) {
 		st.Action = "upload"
 		st.Path = virtual
 		st.Mode = "stor"
 		st.Bytes = 0
 	})
-	s.reply(150, "Opening data connection")
 	n, err := io.Copy(file, conn)
 	s.updateStatus(func(st *status.Session) {
 		st.Action = "idle"
@@ -689,6 +760,16 @@ func (s *session) delete(arg string) {
 		s.reply(550, "Permission denied: public files are admin-managed")
 		return
 	}
+	if isMonitorVirtual(virtual) {
+		if err := s.server.root.Remove(realPath); err != nil {
+			s.logActivity("delete", "failed", arg, "", 0, err.Error())
+			s.reply(550, "Delete failed")
+			return
+		}
+		s.logActivity("delete", "ok", arg, "", 0, "FTP monitor cleanup removed permanently")
+		s.reply(250, "Deleted")
+		return
+	}
 	if _, err := s.server.root.Trash(realPath, virtual, s.user.Username); err != nil {
 		s.logActivity("delete", "failed", arg, "", 0, err.Error())
 		s.reply(550, "Delete failed")
@@ -723,6 +804,16 @@ func (s *session) rmdir(arg string) {
 		s.reply(550, "Permission denied: public folders are admin-managed")
 		return
 	}
+	if isMonitorVirtual(virtual) {
+		if err := s.server.root.RemoveAll(realPath); err != nil {
+			s.logActivity("delete", "failed", arg, "", 0, err.Error())
+			s.reply(550, "Remove failed")
+			return
+		}
+		s.logActivity("delete", "ok", arg, "", 0, "FTP monitor folder removed permanently")
+		s.reply(250, "Removed")
+		return
+	}
 	if _, err := s.server.root.Trash(realPath, virtual, s.user.Username); err != nil {
 		s.logActivity("delete", "failed", arg, "", 0, err.Error())
 		s.reply(550, "Remove failed")
@@ -730,6 +821,12 @@ func (s *session) rmdir(arg string) {
 	}
 	s.logActivity("delete", "ok", arg, "", 0, "FTP folder moved to trash")
 	s.reply(250, "Removed")
+}
+
+func isMonitorVirtual(virtual string) bool {
+	virtual = strings.ReplaceAll(virtual, "\\", "/")
+	virtual = "/" + strings.Trim(virtual, "/")
+	return virtual == "/_monitor" || strings.HasPrefix(virtual, "/_monitor/")
 }
 
 func (s *session) renameFromPath(arg string) {
@@ -1149,15 +1246,6 @@ func (s *session) openData() (net.Conn, error) {
 			}
 			return nil, err
 		}
-		rawConn := conn
-		conn, err = s.protectDataConn(rawConn)
-		if err != nil {
-			_ = rawConn.Close()
-			if port > 0 {
-				s.releasePassivePort(port)
-			}
-			return nil, err
-		}
 		if port > 0 {
 			return &passiveDataConn{Conn: conn, release: func() { s.releasePassivePort(port) }}, nil
 		}
@@ -1170,9 +1258,27 @@ func (s *session) openData() (net.Conn, error) {
 		if err != nil {
 			return nil, err
 		}
-		return s.protectDataConn(conn)
+		return conn, nil
 	}
 	return nil, errors.New("no data connection")
+}
+
+func (s *session) beginDataTransfer() (net.Conn, bool) {
+	conn, err := s.openData()
+	if err != nil {
+		s.reply(425, "Cannot open data connection")
+		return nil, false
+	}
+	s.setDataDeadline(conn)
+	s.reply(150, "Opening data connection")
+	conn, err = s.protectDataConn(conn)
+	if err != nil {
+		_ = conn.Close()
+		s.reply(425, "Cannot secure data connection")
+		return nil, false
+	}
+	s.setDataDeadline(conn)
+	return conn, true
 }
 
 func (s *session) protectDataConn(conn net.Conn) (net.Conn, error) {

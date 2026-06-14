@@ -85,7 +85,6 @@ PY
 ssh "${SSH_OPTS[@]}" "${REMOTE}" "mkdir -p '${REMOTE_DIR}/bin' '${REMOTE_DIR}/var' '${STORAGE_ROOT}/public' '${STORAGE_ROOT}/dropboxes'"
 scp "${SSH_OPTS[@]}" dist/macftpd "${REMOTE}:${REMOTE_DIR}/bin/macftpd.new"
 scp "${SSH_OPTS[@]}" "${tmp_config}" "${REMOTE}:${REMOTE_DIR}/config.json.new"
-scp "${SSH_OPTS[@]}" launchd/com.example.macftpd.plist "${REMOTE}:${REMOTE_DIR}/com.example.macftpd.plist.new"
 rm -f "${tmp_config}"
 
 ssh "${SSH_OPTS[@]}" "${REMOTE}" "REMOTE_DIR='${REMOTE_DIR}' START_MODE='${START_MODE}' bash -s" <<'SH'
@@ -93,6 +92,9 @@ set -euo pipefail
 REMOTE_DIR="${REMOTE_DIR:-/opt/macftpd}"
 chmod 755 "${REMOTE_DIR}/bin/macftpd.new"
 mv "${REMOTE_DIR}/bin/macftpd.new" "${REMOTE_DIR}/bin/macftpd"
+if command -v codesign >/dev/null 2>&1; then
+  codesign --force --sign - --identifier org.rememe.macftpd "${REMOTE_DIR}/bin/macftpd"
+fi
 if [[ ! -f "${REMOTE_DIR}/config.json" ]]; then
   mv "${REMOTE_DIR}/config.json.new" "${REMOTE_DIR}/config.json"
 else
@@ -121,10 +123,41 @@ with open(out_path, "w") as f:
     f.write("\n")
 PY
   mv "${REMOTE_DIR}/config.json.new" "${REMOTE_DIR}/config.json.last_deployed"
-  mv "${REMOTE_DIR}/config.json.merged" "${REMOTE_DIR}/config.json"
+mv "${REMOTE_DIR}/config.json.merged" "${REMOTE_DIR}/config.json"
 fi
 chmod 600 "${REMOTE_DIR}/config.json" "${REMOTE_DIR}/config.json.last_deployed" 2>/dev/null || true
-mv "${REMOTE_DIR}/com.example.macftpd.plist.new" "${REMOTE_DIR}/com.example.macftpd.plist"
+cat >"${REMOTE_DIR}/com.example.macftpd.plist" <<EOF
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "https://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+  <key>Label</key>
+  <string>com.example.macftpd</string>
+  <key>ProgramArguments</key>
+  <array>
+    <string>${REMOTE_DIR}/bin/macftpd</string>
+    <string>-config</string>
+    <string>${REMOTE_DIR}/config.json</string>
+  </array>
+  <key>WorkingDirectory</key>
+  <string>${REMOTE_DIR}</string>
+  <key>RunAtLoad</key>
+  <true/>
+  <key>KeepAlive</key>
+  <true/>
+  <key>StandardOutPath</key>
+  <string>${REMOTE_DIR}/var/macftpd.launchd.log</string>
+  <key>StandardErrorPath</key>
+  <string>${REMOTE_DIR}/var/macftpd.launchd.err.log</string>
+  <key>EnvironmentVariables</key>
+  <dict>
+    <key>PATH</key>
+    <string>/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin:/usr/sbin:/sbin</string>
+  </dict>
+</dict>
+</plist>
+EOF
+plutil -lint "${REMOTE_DIR}/com.example.macftpd.plist"
 cp "${REMOTE_DIR}/com.example.macftpd.plist" "${HOME}/Library/LaunchAgents/com.example.macftpd.plist"
 launchctl bootout "gui/$(id -u)/com.example.macftpd" 2>/dev/null || true
 pkill -x macftpd 2>/dev/null || true
