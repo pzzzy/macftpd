@@ -157,6 +157,67 @@ func TestAdminFileActionCopyMoveAndActivity(t *testing.T) {
 	}
 }
 
+func TestActivityDashboardSuppressesMonitorAndSeparatesSecurity(t *testing.T) {
+	srv := testServer(t)
+	srv.activity.Add(activity.Event{Type: "ftp_login", Protocol: "ftp", Actor: "admin", Remote: "127.0.0.1:50000", Action: "login", Path: "/", Detail: "FTP login"})
+	srv.activity.Add(activity.Event{Type: "ftp_upload", Protocol: "ftp", Actor: "admin", Remote: "127.0.0.1:50000", Action: "upload", Path: "_monitor/probe.txt", Bytes: 12, Detail: "FTP upload"})
+	srv.activity.Add(activity.Event{Type: "ftp_delete", Protocol: "ftp", Actor: "admin", Remote: "127.0.0.1:50000", Action: "delete", Path: "_monitor/probe.txt", Detail: "FTP monitor cleanup removed permanently"})
+	srv.activity.Add(activity.Event{Type: "ftp_login", Protocol: "ftp", Actor: "anonymous", Remote: "203.0.113.10:4444", Action: "login", Outcome: "failed", Detail: "bad FTP credentials"})
+	srv.activity.Add(activity.Event{Type: "http_login", Protocol: "http", Actor: "admin", Remote: "127.0.0.1:60000", Action: "login", Outcome: "failed", Path: "/admin/", Detail: "admin auth failed"})
+	srv.activity.Add(activity.Event{Type: "admin_file", Protocol: "http", Actor: "admin", Remote: "127.0.0.1:60000", Action: "download", Path: "/public/readme.txt", Detail: "admin download"})
+
+	req := httptest.NewRequest(http.MethodGet, "/api/activity?limit=20", nil)
+	req.SetBasicAuth("admin", "secret")
+	rr := httptest.NewRecorder()
+	srv.requireAdmin(srv.activityFeed)(rr, req)
+	if rr.Code != http.StatusOK {
+		t.Fatalf("activity status = %d body=%s", rr.Code, rr.Body.String())
+	}
+	var body struct {
+		Events           []activity.Event `json:"events"`
+		ExternalFailures []activity.Event `json:"external_failures"`
+		AdminMistakes    []activity.Event `json:"admin_mistakes"`
+		Monitor          struct {
+			Count int `json:"count"`
+			OK    int `json:"ok"`
+		} `json:"monitor"`
+	}
+	if err := json.Unmarshal(rr.Body.Bytes(), &body); err != nil {
+		t.Fatalf("decode activity response: %v", err)
+	}
+	if body.Monitor.Count != 2 || body.Monitor.OK != 2 {
+		t.Fatalf("unexpected monitor summary: %#v", body.Monitor)
+	}
+	for _, event := range body.Events {
+		if strings.Contains(event.Path, "_monitor") || strings.Contains(event.Detail, "monitor") {
+			t.Fatalf("monitor event leaked into human feed: %#v", event)
+		}
+	}
+	if len(body.ExternalFailures) != 1 || body.ExternalFailures[0].Remote != "203.0.113.10:4444" {
+		t.Fatalf("unexpected external failures: %#v", body.ExternalFailures)
+	}
+	if len(body.AdminMistakes) != 1 || body.AdminMistakes[0].Path != "/admin/" {
+		t.Fatalf("unexpected admin mistakes: %#v", body.AdminMistakes)
+	}
+
+	req = httptest.NewRequest(http.MethodGet, "/admin/partials/activity", nil)
+	req.SetBasicAuth("admin", "secret")
+	rr = httptest.NewRecorder()
+	srv.requireAdmin(srv.adminActivityPartial)(rr, req)
+	if rr.Code != http.StatusOK {
+		t.Fatalf("partial status = %d body=%s", rr.Code, rr.Body.String())
+	}
+	rendered := rr.Body.String()
+	for _, needle := range []string{"Security and Events", "External Failures", "Admin and User Mistakes", "Monitor Checks", "total 2"} {
+		if !strings.Contains(rendered, needle) {
+			t.Fatalf("activity partial missing %q: %s", needle, rendered)
+		}
+	}
+	if strings.Contains(rendered, "_monitor/probe.txt") {
+		t.Fatalf("activity partial leaked monitor path: %s", rendered)
+	}
+}
+
 func TestUploadRejectsIgnoredDestination(t *testing.T) {
 	srv := testServer(t)
 	var body bytes.Buffer

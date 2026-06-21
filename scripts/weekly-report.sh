@@ -62,6 +62,7 @@ import datetime as dt
 import gzip
 import json
 import pathlib
+import re
 import sys
 
 var_dir = pathlib.Path(sys.argv[1])
@@ -82,6 +83,9 @@ def parse_time(value):
     if not value:
         return None
     value = value.replace("Z", "+00:00")
+    match = re.match(r"(.*\.)(\d+)([+-]\d\d:\d\d)$", value)
+    if match:
+        value = match.group(1) + (match.group(2) + "000000")[:6] + match.group(3)
     try:
         parsed = dt.datetime.fromisoformat(value)
     except ValueError:
@@ -108,13 +112,18 @@ for path in paths:
                 first = when if first is None or when < first else first
                 last = when if last is None or when > last else last
                 action = event.get("action") or "unknown"
-                status = event.get("status") or "unknown"
-                counts[(action, status)] += 1
+                outcome = event.get("outcome") or event.get("status") or "unknown"
+                counts[(action, outcome)] += 1
                 try:
-                    bytes_by_action[action] += int(event.get("bytes") or 0)
+                    detail = event.get("detail") or {}
+                    if isinstance(detail, dict):
+                        size = detail.get("bytes") or detail.get("size") or 0
+                    else:
+                        size = event.get("bytes") or 0
+                    bytes_by_action[action] += int(size or 0)
                 except (TypeError, ValueError):
                     pass
-                if status != "ok":
+                if outcome not in ("ok", "success"):
                     failures[(action, event.get("detail") or "failed")] += 1
                 path_value = event.get("path") or ""
                 if path_value and not path_value.startswith("/_monitor") and not path_value.startswith("_monitor"):
@@ -142,7 +151,7 @@ if paths_by_action:
         print(f"- {action}: `{count}` `{str(path_value).replace('`', chr(39))}`")
 PY
   printf '\n## Launchd\n\n'
-  for label in com.example.macftpd com.example.macftpd-cloudflared com.example.macftpd-monitor com.example.macftpd-logrotate com.example.macftpd-weekly-report com.example.macftpd-cert-renew; do
+  for label in com.example.macftpd com.example.macftpd-cloudflared com.example.macftpd-monitor com.example.macftpd-logrotate com.example.macftpd-weekly-report com.example.macftpd.cert-renew; do
     if launchctl print "gui/$(id -u)/${label}" >/tmp/macftpd-weekly-launchd.$$ 2>/dev/null; then
       state="$(awk -F'= ' '/state = / {print $2; exit}' /tmp/macftpd-weekly-launchd.$$)"
       pid="$(awk -F'= ' '/pid = / {print $2; exit}' /tmp/macftpd-weekly-launchd.$$)"

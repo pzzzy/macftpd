@@ -1,12 +1,12 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-VERSION="${VERSION:-2026.6.0}"
+VERSION="${VERSION:-2026.6.1}"
 REMOTE="${REMOTE:-}"
 KEY="${KEY:-}"
 REMOTE_DIR="${REMOTE_DIR:-/opt/macftpd}"
 INSTALL_PATH="${INSTALL_PATH:-${REMOTE_DIR}/bin/cloudflared}"
-EXPECTED_BINARY_SHA256_DARWIN_ARM64="${EXPECTED_BINARY_SHA256_DARWIN_ARM64:-1b66920a280235b0180e935c6fb2adcf91fceeeaf66c4365e606bd37d6c587ef}"
+EXPECTED_BINARY_SHA256_DARWIN_ARM64="${EXPECTED_BINARY_SHA256_DARWIN_ARM64:-ae6ee90188ae5833c687ce937c3693e28403677607c06c65a2ff2b6a022f50e4}"
 ASSET="cloudflared-darwin-arm64.tgz"
 URL="https://github.com/cloudflare/cloudflared/releases/download/${VERSION}/${ASSET}"
 SSH_OPTS=()
@@ -39,6 +39,9 @@ if [[ -n "${REMOTE}" ]]; then
   ssh "${SSH_OPTS[@]}" "${REMOTE}" "REMOTE_DIR='${REMOTE_DIR}' bash -s" <<'SH'
 set -euo pipefail
 chmod 755 "${REMOTE_DIR}/bin/cloudflared.new"
+if [[ -f "${REMOTE_DIR}/bin/cloudflared" ]]; then
+  cp "${REMOTE_DIR}/bin/cloudflared" "${REMOTE_DIR}/bin/cloudflared.prev.$(date -u +%Y%m%dT%H%M%SZ)"
+fi
 mv "${REMOTE_DIR}/bin/cloudflared.new" "${REMOTE_DIR}/bin/cloudflared"
 "${REMOTE_DIR}/bin/cloudflared" --version
 if launchctl print "gui/$(id -u)/com.example.macftpd-cloudflared" >/dev/null 2>&1; then

@@ -54,6 +54,23 @@ type principal struct {
 	Perms auth.PermissionSet
 }
 
+type activityMonitorSummary struct {
+	Count      int            `json:"count"`
+	OK         int            `json:"ok"`
+	Failed     int            `json:"failed"`
+	Last       activity.Event `json:"last,omitempty"`
+	LastOK     activity.Event `json:"last_ok,omitempty"`
+	LastFailed activity.Event `json:"last_failed,omitempty"`
+}
+
+type activityDashboard struct {
+	Events           []activity.Event       `json:"events"`
+	Security         []activity.Event       `json:"security"`
+	ExternalFailures []activity.Event       `json:"external_failures"`
+	AdminMistakes    []activity.Event       `json:"admin_mistakes"`
+	Monitor          activityMonitorSummary `json:"monitor"`
+}
+
 type userRequest struct {
 	Username    string             `json:"username"`
 	Password    string             `json:"password"`
@@ -780,7 +797,7 @@ func (s *Server) adminActivityPartial(w http.ResponseWriter, r *http.Request, _ 
 		limit = 80
 	}
 	w.Header().Set("Content-Type", "text/html; charset=utf-8")
-	_ = activityPartialTemplate.Execute(w, map[string]any{"Events": s.activity.Recent(limit, 0)})
+	_ = activityPartialTemplate.Execute(w, s.activityDashboard(limit, 0))
 }
 
 func (s *Server) adminStatusPartial(w http.ResponseWriter, r *http.Request, _ principal) {
@@ -1570,8 +1587,107 @@ func (s *Server) activityFeed(w http.ResponseWriter, r *http.Request, _ principa
 	}
 	limit, _ := strconv.Atoi(r.URL.Query().Get("limit"))
 	after, _ := strconv.ParseInt(r.URL.Query().Get("after"), 10, 64)
-	events := s.activity.Recent(limit, after)
-	writeJSON(w, http.StatusOK, map[string]any{"events": events})
+	writeJSON(w, http.StatusOK, s.activityDashboard(limit, after))
+}
+
+func (s *Server) activityDashboard(limit int, after int64) activityDashboard {
+	if limit <= 0 || limit > 200 {
+		limit = 80
+	}
+	scanLimit := limit * 6
+	if scanLimit < 200 {
+		scanLimit = 200
+	}
+	if scanLimit > 500 {
+		scanLimit = 500
+	}
+	dashboard := activityDashboard{
+		Events:           []activity.Event{},
+		Security:         []activity.Event{},
+		ExternalFailures: []activity.Event{},
+		AdminMistakes:    []activity.Event{},
+	}
+	for _, event := range s.activity.Recent(scanLimit, after) {
+		if isMonitorActivity(event) {
+			dashboard.Monitor.Count++
+			if dashboard.Monitor.Last.ID == 0 {
+				dashboard.Monitor.Last = event
+			}
+			if isSecurityActivity(event) {
+				dashboard.Monitor.Failed++
+				if dashboard.Monitor.LastFailed.ID == 0 {
+					dashboard.Monitor.LastFailed = event
+				}
+			} else {
+				dashboard.Monitor.OK++
+				if dashboard.Monitor.LastOK.ID == 0 {
+					dashboard.Monitor.LastOK = event
+				}
+			}
+			continue
+		}
+		if isSecurityActivity(event) {
+			if len(dashboard.Security) < 12 {
+				dashboard.Security = append(dashboard.Security, event)
+			}
+			if isLocalOrKnownAdminActivity(event) {
+				if len(dashboard.AdminMistakes) < 8 {
+					dashboard.AdminMistakes = append(dashboard.AdminMistakes, event)
+				}
+			} else if len(dashboard.ExternalFailures) < 8 {
+				dashboard.ExternalFailures = append(dashboard.ExternalFailures, event)
+			}
+		}
+		if len(dashboard.Events) < limit {
+			dashboard.Events = append(dashboard.Events, event)
+		}
+	}
+	return dashboard
+}
+
+func isMonitorActivity(event activity.Event) bool {
+	pathValue := strings.TrimPrefix(event.Path, "/")
+	destValue := strings.TrimPrefix(event.DestPath, "/")
+	if pathValue == "_monitor" || strings.HasPrefix(pathValue, "_monitor/") {
+		return true
+	}
+	if destValue == "_monitor" || strings.HasPrefix(destValue, "_monitor/") {
+		return true
+	}
+	detail := strings.ToLower(event.Detail + " " + event.Message)
+	return strings.Contains(detail, "monitor")
+}
+
+func isSecurityActivity(event activity.Event) bool {
+	switch strings.ToLower(event.Outcome) {
+	case "failed", "denied", "limited":
+		return true
+	}
+	return event.Type == "http_security"
+}
+
+func isLocalOrKnownAdminActivity(event activity.Event) bool {
+	if isLoopbackRemote(event.Remote) {
+		return true
+	}
+	actor := strings.ToLower(strings.TrimSpace(event.Actor))
+	if actor == "" || actor == "anonymous" || actor == "someone" {
+		return false
+	}
+	if strings.HasPrefix(event.Type, "admin_") || event.Type == "http_login" || event.Type == "http_logout" {
+		return true
+	}
+	return actor == "admin"
+}
+
+func isLoopbackRemote(remote string) bool {
+	host := remote
+	if h, _, err := net.SplitHostPort(remote); err == nil {
+		host = h
+	}
+	host = strings.Trim(host, "[]")
+	ip := net.ParseIP(host)
+	return ip != nil && ip.IsLoopback()
 }
 
 func (s *Server) statusAPI(w http.ResponseWriter, r *http.Request, _ principal) {

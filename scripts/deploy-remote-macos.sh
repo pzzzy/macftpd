@@ -91,6 +91,9 @@ ssh "${SSH_OPTS[@]}" "${REMOTE}" "REMOTE_DIR='${REMOTE_DIR}' START_MODE='${START
 set -euo pipefail
 REMOTE_DIR="${REMOTE_DIR:-/opt/macftpd}"
 chmod 755 "${REMOTE_DIR}/bin/macftpd.new"
+if [[ -f "${REMOTE_DIR}/bin/macftpd" ]]; then
+  cp "${REMOTE_DIR}/bin/macftpd" "${REMOTE_DIR}/bin/macftpd.prev.$(date -u +%Y%m%dT%H%M%SZ)"
+fi
 mv "${REMOTE_DIR}/bin/macftpd.new" "${REMOTE_DIR}/bin/macftpd"
 if command -v codesign >/dev/null 2>&1; then
   codesign --force --sign - --identifier org.rememe.macftpd "${REMOTE_DIR}/bin/macftpd"
