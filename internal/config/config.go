@@ -6,6 +6,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"net/url"
 	"os"
 	"path/filepath"
 	"strings"
@@ -44,8 +45,10 @@ type HTTPConfig struct {
 	PublicCacheControl string   `json:"public_cache_control"`
 	TurnstileSiteKey   string   `json:"turnstile_site_key"`
 	TurnstileSecret    string   `json:"turnstile_secret"`
+	ReadHeaderTimeout  Duration `json:"read_header_timeout"`
 	ReadTimeout        Duration `json:"read_timeout"`
 	WriteTimeout       Duration `json:"write_timeout"`
+	IdleTimeout        Duration `json:"idle_timeout"`
 }
 
 type StorageConfig struct {
@@ -115,14 +118,14 @@ func Default() Config {
 		HTTP: HTTPConfig{
 			Listen:             "127.0.0.1:8080",
 			PublicCacheControl: "public, max-age=300, stale-while-revalidate=60",
-			ReadTimeout:        Duration(10 * time.Second),
-			WriteTimeout:       Duration(60 * time.Second),
+			ReadHeaderTimeout:  Duration(10 * time.Second),
+			IdleTimeout:        Duration(60 * time.Second),
 		},
 		Storage: StorageConfig{
 			Root:       "./var/ftpd",
 			PublicDir:  "public",
 			DropboxDir: "dropboxes",
-			Ignore:     []string{".DS_Store", "._*", ".AppleDouble", ".Spotlight-V100", ".Trashes", ".fseventsd", ".TemporaryItems", ".apdisk", ".git", ".svn", ".hg", ".env", ".ssh", "._macftpd_trash", "._macftpd_versions"},
+			Ignore:     []string{".DS_Store", "._*", ".AppleDouble", ".Spotlight-V100", ".Trashes", ".fseventsd", ".TemporaryItems", ".apdisk", ".git", ".svn", ".hg", ".env", ".ssh", "._macftpd_trash", "._macftpd_versions", "._macftpd_uploads"},
 		},
 		Auth: AuthConfig{
 			UsersPath:          "./var/users.json",
@@ -162,6 +165,13 @@ func (c *Config) Normalize() error {
 	}
 	if c.HTTP.Listen == "" {
 		c.HTTP.Listen = Default().HTTP.Listen
+	}
+	c.HTTP.PublicBaseURL = strings.TrimRight(strings.TrimSpace(c.HTTP.PublicBaseURL), "/")
+	if c.HTTP.PublicBaseURL != "" {
+		publicURL, err := url.Parse(c.HTTP.PublicBaseURL)
+		if err != nil || (publicURL.Scheme != "http" && publicURL.Scheme != "https") || publicURL.Host == "" || publicURL.User != nil || publicURL.RawQuery != "" || publicURL.Fragment != "" || publicURL.Path != "" {
+			return errors.New("http.public_base_url must be an HTTP(S) origin without credentials, path, query, or fragment")
+		}
 	}
 	if c.Storage.Root == "" {
 		return errors.New("storage.root is required")

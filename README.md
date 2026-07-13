@@ -15,6 +15,7 @@ Current capabilities:
 - Public upload drops (`/d/<id>/<token>`) with the same chunked upload path as the admin UI; uploads into `public` return the public download URL.
 - NAT-PMP and UPnP IGD automatic TCP port mapping for FTP control and passive data ports when the router supports it.
 - Remote macOS deployment through launchd with a repairable `/opt/macftpd` app folder and `/srv/macftpd/files` storage root.
+- Transactional FTP, HTTP, drop-link, chunked, and remote-pull uploads: data is staged under a permanently hidden internal directory and only swapped into place after the transfer and retained-version copy succeed.
 
 ## Local Development
 
@@ -26,6 +27,10 @@ go run ./cmd/macftpd -config configs/macftpd.example.json
 ```
 
 The generated admin/public CSS and local HTMX asset are embedded into the Go binary from `internal/httpapi/static`. Run `npm run build` after changing templates or CSS.
+
+HTTP body read/write deadlines are disabled by default so large uploads and downloads can stream for as long as they are making progress. Header parsing still has a 10-second deadline and idle keep-alive connections expire after 60 seconds. Set `http.read_timeout` or `http.write_timeout` only when you intentionally want a whole-request or whole-response deadline.
+
+The overnight 10,824,083,788-byte MKV validation completed successfully. macftpd streamed the object unchanged; it does not transcode, remux, or otherwise process media. See [Large Transfer Operations](docs/large-transfers.md) for the range-request interpretation, validation commands, and timeout guidance derived from that run.
 
 For local-only testing, override paths and ports:
 
@@ -56,6 +61,19 @@ ADMIN_PASS='choose-a-strong-password' ./scripts/deploy-remote-macos.sh
 ```
 
 The first deploy writes `/opt/macftpd/config.json`. Later deploys merge generated operational settings into the active config while preserving secrets such as the admin password and session key. The previous active config is backed up as `config.json.backup.<timestamp>`, and the generated config is also kept as `config.json.last_deployed`.
+
+For a stable macOS code identity across upgrades, install a local signing identity once on the destination Mac, then pass it to deploys:
+
+```bash
+REMOTE_DIR=/opt/macftpd ./scripts/install-macos-codesign-identity.sh
+
+MACFTPD_CODESIGN_IDENTITY='macftpd local code signing' \
+MACFTPD_CODESIGN_KEYCHAIN='/opt/macftpd/var/macftpd-codesign.keychain-db' \
+MACFTPD_CODESIGN_KEYCHAIN_PASS_FILE='/opt/macftpd/var/macftpd-codesign.keychain.pass' \
+./scripts/deploy-remote-macos.sh
+```
+
+Run the installer on the remote Mac itself. It prints the three values needed by the deploy script. If no stable identity is configured, deploy falls back to ad-hoc signing and warns that macOS may ask for removable-volume access again after a binary replacement.
 
 Override `REMOTE_DIR` and `STORAGE_ROOT` for site-specific installs, for example a home-directory app folder with an external-volume FTP root:
 
@@ -102,6 +120,8 @@ wrangler deploy --config cloudflare/wrangler.jsonc
 ```
 
 The Worker forwards the public host to the origin with `X-Forwarded-Host` and `X-Macftpd-Public-Host` so admin CSRF checks see browser requests from `ftp.example.com`, while `/public/*` remains cached at the edge and admin/API traffic remains `no-store`.
+
+Set `http.public_base_url` (or `MACFTPD_PUBLIC_BASE_URL`) to the externally visible HTTPS origin when admin traffic can reach macftpd through another hostname. Successful HTTP public mutations purge the configured cache tag, with exact file and parent-listing purges as a fallback. Successful FTP mutations under the public root also purge the tag. Cache invalidation requires `cloudflare.enabled`, `zone_id`, `api_token`, and `cache_tag`.
 
 Optional hardening helpers:
 
@@ -156,16 +176,11 @@ Other admin endpoints include `/api/users`, `/api/groups`, `/api/files`, `/api/f
 Before a release candidate, run:
 
 ```bash
-go test ./...
-go test -race ./...
-go vet ./...
-npm run build
-./scripts/check-private-identifiers.sh
-go run github.com/securego/gosec/v2/cmd/gosec@latest ./...
-go run golang.org/x/vuln/cmd/govulncheck@latest ./...
-wrangler deploy --config cloudflare/wrangler.jsonc --dry-run
+./scripts/check.sh
 ADMIN_PASS="$(cat var/admin-pass.txt)" ./scripts/smoke-remote.sh
 ```
+
+`scripts/check.sh` is the same release gate used by GitHub Actions. It verifies formatting and modules; runs shuffled tests, race tests, vet, native and Darwin/arm64 builds; rebuilds embedded assets reproducibly; checks shell and Worker syntax; scans for private identifiers; runs pinned gosec and govulncheck versions; and performs a Wrangler dry run.
 
 Then verify through `https://ftp.example.com`: admin login, create/edit/delete a test user, chunked admin upload of a large file, direct `/s/` share of that file with correct MIME/disposition, protected `/d/` drop upload, public cache `MISS` then `HIT`, and the remote Mac monitor screen showing `status=ok`.
 
@@ -181,7 +196,7 @@ Use `"external_ip": "auto"` with `"auto_map": true` to advertise the discovered 
 
 Default storage ignore rules hide and deny downloads for macOS metadata and sensitive dot-directories such as `.DS_Store`, `._*`, `.AppleDouble`, `.Spotlight-V100`, `.Trashes`, `.git`, `.env`, and `.ssh`. Adjust `storage.ignore` in `config.json` if you need a different policy.
 
-Deletes move files into `._macftpd_trash`, and overwrites create retained versions under `._macftpd_versions`; both locations are hidden by default ignore rules. Restore from the admin UI or `/api/retention/restore`.
+Deletes move files into `._macftpd_trash`, overwrites create retained versions under `._macftpd_versions`, and in-progress uploads use `._macftpd_uploads`. These internal locations are denied and hidden even if an operator removes them from `storage.ignore`. Restore retained data from the admin UI or `/api/retention/restore`.
 
 Keep `ftp.allow_fxp` disabled unless you explicitly trust server-to-server active FTP targets. The HTTP `/api/fxp` endpoint performs authenticated remote FTP pulls into local storage and is admin-only.
 

@@ -28,6 +28,70 @@ import (
 	"macftpd/internal/storage"
 )
 
+func TestFTPRequireTLSNeedsCertificate(t *testing.T) {
+	_, err := New(config.FTPConfig{RequireTLS: true}, nil, nil, nil, nil)
+	if err == nil || !strings.Contains(err.Error(), "requires ftp.tls_cert_file and ftp.tls_key_file") {
+		t.Fatalf("New() error = %v, want missing FTPS certificate error", err)
+	}
+}
+
+func TestPassiveDataPeerMustMatchControlPeer(t *testing.T) {
+	control := &net.TCPAddr{IP: net.ParseIP("203.0.113.10"), Port: 2121}
+	samePeer := &net.TCPAddr{IP: net.ParseIP("203.0.113.10"), Port: 50000}
+	otherPeer := &net.TCPAddr{IP: net.ParseIP("203.0.113.11"), Port: 50000}
+	if !passivePeerAllowed(control, samePeer, false) {
+		t.Fatal("matching passive data peer was denied")
+	}
+	if passivePeerAllowed(control, otherPeer, false) {
+		t.Fatal("unrelated passive data peer was allowed while FXP was disabled")
+	}
+	if !passivePeerAllowed(control, otherPeer, true) {
+		t.Fatal("FXP-enabled passive data peer was denied")
+	}
+}
+
+func TestFTPActiveSessionRevalidatesDisabledUser(t *testing.T) {
+	dir := t.TempDir()
+	store, err := auth.Open(dir + "/users.json")
+	if err != nil {
+		t.Fatal(err)
+	}
+	user := auth.User{Username: "reader", Home: "/reader", Permissions: auth.ReadOnlyPermissions()}
+	if err := store.UpsertUser(user, "secret"); err != nil {
+		t.Fatal(err)
+	}
+	root, err := storage.New(dir+"/root", "public", "dropboxes", nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	server, err := New(config.FTPConfig{Listen: "127.0.0.1:0", Welcome: "test"}, store, root, activity.New(100), nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	go func() { _ = server.ListenAndServe(ctx) }()
+
+	conn, err := ftpclient.Dial(waitAddr(t, server), ftpclient.DialWithTimeout(5*time.Second))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer conn.Quit()
+	if err := conn.Login("reader", "secret"); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := conn.CurrentDir(); err != nil {
+		t.Fatalf("active account PWD failed: %v", err)
+	}
+	user.Disabled = true
+	if err := store.UpsertUser(user, ""); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := conn.CurrentDir(); err == nil {
+		t.Fatal("disabled user retained access through an existing FTP session")
+	}
+}
+
 func TestFTPStoreRetrieveAndDelete(t *testing.T) {
 	dir := t.TempDir()
 	store, err := auth.Open(dir + "/users.json")
@@ -100,6 +164,50 @@ func TestFTPStoreRetrieveAndDelete(t *testing.T) {
 		}
 	case <-time.After(2 * time.Second):
 		t.Fatal("server did not stop")
+	}
+}
+
+func TestFTPStorePreservesDestinationWhenVersioningFails(t *testing.T) {
+	dir := t.TempDir()
+	store, err := auth.Open(dir + "/users.json")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := store.BootstrapAdmin("admin", "secret"); err != nil {
+		t.Fatal(err)
+	}
+	root, err := storage.New(dir+"/root", "public", "dropboxes", nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(root.Base+"/movie.mkv", []byte("original"), 0o640); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(root.Base+"/._macftpd_versions", []byte("block retention directory"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	server, err := New(config.FTPConfig{Listen: "127.0.0.1:0", Welcome: "test"}, store, root, activity.New(100), nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	go func() { _ = server.ListenAndServe(ctx) }()
+
+	conn, err := ftpclient.Dial(waitAddr(t, server), ftpclient.DialWithTimeout(5*time.Second))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer conn.Quit()
+	if err := conn.Login("admin", "secret"); err != nil {
+		t.Fatal(err)
+	}
+	if err := conn.Stor("movie.mkv", strings.NewReader("replacement")); err == nil {
+		t.Fatal("expected FTP upload to report retention failure")
+	}
+	raw, err := os.ReadFile(root.Base + "/movie.mkv")
+	if err != nil || string(raw) != "original" {
+		t.Fatalf("destination changed after failed retention: payload=%q err=%v", raw, err)
 	}
 }
 

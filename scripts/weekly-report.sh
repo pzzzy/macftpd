@@ -72,12 +72,17 @@ paths = [var_dir / "activity.jsonl"]
 paths.extend(sorted(var_dir.glob("activity.jsonl.*.gz")))
 
 counts = collections.Counter()
+monitor_counts = collections.Counter()
 failures = collections.Counter()
+monitor_failures = collections.Counter()
 bytes_by_action = collections.Counter()
 paths_by_action = collections.Counter()
 first = None
 last = None
 total = 0
+monitor_total = 0
+maintenance_total = 0
+human_total = 0
 
 def parse_time(value):
     if not value:
@@ -93,6 +98,43 @@ def parse_time(value):
     if parsed.tzinfo is None:
         parsed = parsed.replace(tzinfo=dt.timezone.utc)
     return parsed
+
+def is_loopback(remote):
+    host = str(remote or "").strip()
+    if host.startswith("[") and "]" in host:
+        host = host[1:host.index("]")]
+    elif ":" in host:
+        host = host.rsplit(":", 1)[0]
+    return host in ("127.0.0.1", "::1", "localhost")
+
+def is_monitor_event(event):
+    path_value = str(event.get("path") or "").lstrip("/")
+    dest_value = str(event.get("dest_path") or "").lstrip("/")
+    if path_value == "_monitor" or path_value.startswith("_monitor/"):
+        return True
+    if dest_value == "_monitor" or dest_value.startswith("_monitor/"):
+        return True
+    detail = f"{event.get('detail') or ''} {event.get('message') or ''}".lower()
+    if "monitor" in detail:
+        return True
+    return (
+        event.get("type") == "ftp_login"
+        and event.get("protocol") == "ftp"
+        and event.get("action") == "login"
+        and event.get("actor") == "admin"
+        and path_value in ("",)
+        and is_loopback(event.get("remote"))
+    )
+
+def is_maintenance_probe_event(event):
+    return (
+        event.get("type") == "http_login"
+        and event.get("protocol") == "http"
+        and event.get("action") == "login"
+        and event.get("outcome") == "failed"
+        and event.get("path") == "/api/activity"
+        and is_loopback(event.get("remote"))
+    )
 
 for path in paths:
     if not path.exists():
@@ -113,25 +155,41 @@ for path in paths:
                 last = when if last is None or when > last else last
                 action = event.get("action") or "unknown"
                 outcome = event.get("outcome") or event.get("status") or "unknown"
-                counts[(action, outcome)] += 1
+                monitor = is_monitor_event(event)
+                maintenance = is_maintenance_probe_event(event)
+                if monitor:
+                    monitor_total += 1
+                    monitor_counts[(action, outcome)] += 1
+                elif maintenance:
+                    maintenance_total += 1
+                else:
+                    human_total += 1
+                    counts[(action, outcome)] += 1
                 try:
                     detail = event.get("detail") or {}
                     if isinstance(detail, dict):
                         size = detail.get("bytes") or detail.get("size") or 0
                     else:
                         size = event.get("bytes") or 0
-                    bytes_by_action[action] += int(size or 0)
+                    if not monitor and not maintenance:
+                        bytes_by_action[action] += int(size or 0)
                 except (TypeError, ValueError):
                     pass
                 if outcome not in ("ok", "success"):
-                    failures[(action, event.get("detail") or "failed")] += 1
+                    if monitor:
+                        monitor_failures[(action, event.get("detail") or "failed")] += 1
+                    elif not maintenance:
+                        failures[(action, event.get("detail") or "failed")] += 1
                 path_value = event.get("path") or ""
-                if path_value and not path_value.startswith("/_monitor") and not path_value.startswith("_monitor"):
+                if not monitor and not maintenance and path_value:
                     paths_by_action[(action, path_value)] += 1
     except OSError:
         continue
 
 print(f"- total_events: `{total}`")
+print(f"- human_visible_events: `{human_total}`")
+print(f"- monitor_events: `{monitor_total}`")
+print(f"- maintenance_probe_events: `{maintenance_total}`")
 if first and last:
     print(f"- first_event: `{first.isoformat()}`")
     print(f"- last_event: `{last.isoformat()}`")
@@ -143,6 +201,15 @@ for action, size in bytes_by_action.most_common():
 if failures:
     print("\n### Failures\n")
     for (action, detail), count in failures.most_common(10):
+        detail = str(detail).replace("`", "'")
+        print(f"- {action}: `{count}` `{detail[:160]}`")
+if monitor_counts:
+    print("\n### Monitor Summary\n")
+    for (action, status), count in monitor_counts.most_common():
+        print(f"- {action}.{status}: `{count}`")
+if monitor_failures:
+    print("\n### Monitor Failures\n")
+    for (action, detail), count in monitor_failures.most_common(10):
         detail = str(detail).replace("`", "'")
         print(f"- {action}: `{count}` `{detail[:160]}`")
 if paths_by_action:
