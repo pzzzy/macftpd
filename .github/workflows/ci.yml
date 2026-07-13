@@ -30,6 +30,10 @@ jobs:
         with:
           node-version: 24
           cache: npm
+      - name: Install release gate tools
+        run: |
+          sudo apt-get update
+          sudo apt-get install --yes ripgrep shellcheck
       - name: Run release gate
         run: ./scripts/check.sh
 
