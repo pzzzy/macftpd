@@ -10,6 +10,7 @@ import (
 	"path/filepath"
 	"sort"
 	"strings"
+	"sync"
 	"time"
 
 	"macftpd/internal/auth"
@@ -22,6 +23,7 @@ type Root struct {
 	PublicDir  string
 	DropboxDir string
 	Ignore     []string
+	mutationMu sync.Mutex
 }
 
 type Entry struct {
@@ -177,6 +179,9 @@ func (r *Root) IsIgnoredVirtual(virtual string) bool {
 		return false
 	}
 	for _, segment := range strings.Split(strings.TrimPrefix(virtual, "/"), "/") {
+		if isInternalStorageName(segment) {
+			return true
+		}
 		for _, pattern := range r.Ignore {
 			matched, err := filepath.Match(pattern, segment)
 			if err == nil && matched {
@@ -188,6 +193,15 @@ func (r *Root) IsIgnoredVirtual(virtual string) bool {
 		}
 	}
 	return false
+}
+
+func isInternalStorageName(name string) bool {
+	switch name {
+	case "._macftpd_trash", "._macftpd_versions", "._macftpd_uploads":
+		return true
+	default:
+		return false
+	}
 }
 
 func entryFromInfo(info fs.FileInfo, virtual string) Entry {
@@ -481,6 +495,54 @@ func (r *Root) Rename(oldPath, newPath string) error {
 	return root.Rename(oldRel, newRel)
 }
 
+// ReplaceFile atomically replaces destPath with a fully written staged file.
+// When preserve is true, the current destination is versioned before the swap.
+func (r *Root) ReplaceFile(stagedPath, destPath, virtual, actor string, preserve bool) error {
+	r.mutationMu.Lock()
+	defer r.mutationMu.Unlock()
+	if info, err := r.Stat(destPath); err == nil {
+		if info.IsDir() {
+			return errors.New("destination is a directory")
+		}
+		if preserve {
+			if _, err := r.Version(destPath, virtual, actor); err != nil {
+				return fmt.Errorf("preserve current version: %w", err)
+			}
+		}
+	} else if !errors.Is(err, os.ErrNotExist) {
+		return err
+	}
+	return r.Rename(stagedPath, destPath)
+}
+
+// InstallFile atomically installs a staged file only when the destination does
+// not already exist. Hard-linking provides no-replace semantics on one volume.
+func (r *Root) InstallFile(stagedPath, destPath string) error {
+	r.mutationMu.Lock()
+	defer r.mutationMu.Unlock()
+	root, err := os.OpenRoot(r.Base)
+	if err != nil {
+		return err
+	}
+	defer root.Close()
+	stagedRel, err := r.relFromReal(stagedPath)
+	if err != nil {
+		return err
+	}
+	destRel, err := r.relFromReal(destPath)
+	if err != nil {
+		return err
+	}
+	if err := root.Link(stagedRel, destRel); err != nil {
+		return err
+	}
+	if err := root.Remove(stagedRel); err != nil {
+		_ = root.Remove(destRel)
+		return err
+	}
+	return nil
+}
+
 func (r *Root) retain(realPath, virtual, actor, rootName string, move bool) (RetainedEntry, error) {
 	info, err := r.Stat(realPath)
 	if err != nil {
@@ -495,6 +557,9 @@ func (r *Root) retain(realPath, virtual, actor, rootName string, move bool) (Ret
 	if err := os.MkdirAll(retainedDir, 0o750); err != nil {
 		return RetainedEntry{}, err
 	}
+	cleanup := func() {
+		_ = os.RemoveAll(retainedDir)
+	}
 	entry := RetainedEntry{
 		ID:           id,
 		OriginalPath: cleanVirtual(virtual),
@@ -505,18 +570,27 @@ func (r *Root) retain(realPath, virtual, actor, rootName string, move bool) (Ret
 	}
 	raw, err := json.MarshalIndent(entry, "", "  ")
 	if err != nil {
+		cleanup()
 		return RetainedEntry{}, err
 	}
 	if move {
 		if err := os.Rename(realPath, payload); err != nil {
+			cleanup()
 			return RetainedEntry{}, err
 		}
 	} else {
 		if _, err := r.Copy(realPath, payload, CopyOptions{Deduplicate: true, Overwrite: true}); err != nil {
+			cleanup()
 			return RetainedEntry{}, err
 		}
 	}
 	if err := os.WriteFile(filepath.Join(retainedDir, ".macftpd-retain.json"), raw, 0o600); err != nil {
+		if move {
+			if rollbackErr := os.Rename(payload, realPath); rollbackErr != nil {
+				return RetainedEntry{}, errors.Join(err, fmt.Errorf("restore source after retention failure: %w", rollbackErr))
+			}
+		}
+		cleanup()
 		return RetainedEntry{}, err
 	}
 	return entry, nil

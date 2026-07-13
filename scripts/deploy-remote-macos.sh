@@ -6,8 +6,12 @@ KEY="${KEY:-}"
 REMOTE_DIR="${REMOTE_DIR:-/opt/macftpd}"
 STORAGE_ROOT="${STORAGE_ROOT:-/srv/macftpd/files}"
 START_MODE="${START_MODE:-manual}"
+MACFTPD_CODESIGN_IDENTITY="${MACFTPD_CODESIGN_IDENTITY:-}"
+MACFTPD_CODESIGN_KEYCHAIN="${MACFTPD_CODESIGN_KEYCHAIN:-}"
+MACFTPD_CODESIGN_KEYCHAIN_PASS_FILE="${MACFTPD_CODESIGN_KEYCHAIN_PASS_FILE:-}"
 FTP_LISTEN="${FTP_LISTEN:-0.0.0.0:2121}"
 HTTP_LISTEN="${HTTP_LISTEN:-0.0.0.0:8080}"
+PUBLIC_BASE_URL="${PUBLIC_BASE_URL:-}"
 PASSIVE_PORTS="${PASSIVE_PORTS:-50000-50100}"
 FTP_EXTERNAL_IP="${FTP_EXTERNAL_IP:-auto}"
 FTP_AUTO_MAP="${FTP_AUTO_MAP:-true}"
@@ -53,17 +57,19 @@ cfg = {
   },
   "http": {
     "listen": "${HTTP_LISTEN}",
-    "public_base_url": "",
+    "public_base_url": "${PUBLIC_BASE_URL}",
     "session_key": "${SESSION_KEY}",
     "public_cache_control": "public, max-age=300, stale-while-revalidate=60",
-    "read_timeout": "10s",
-    "write_timeout": "60s"
+    "read_header_timeout": "10s",
+    "read_timeout": "0s",
+    "write_timeout": "0s",
+    "idle_timeout": "60s"
   },
   "storage": {
     "root": "${STORAGE_ROOT}",
     "public_dir": "public",
     "dropbox_dir": "dropboxes",
-    "ignore": [".DS_Store", "._*", ".AppleDouble", ".Spotlight-V100", ".Trashes", ".fseventsd", ".TemporaryItems", ".apdisk", ".git", ".svn", ".hg", ".env", ".ssh", "._macftpd_trash", "._macftpd_versions"]
+    "ignore": [".DS_Store", "._*", ".AppleDouble", ".Spotlight-V100", ".Trashes", ".fseventsd", ".TemporaryItems", ".apdisk", ".git", ".svn", ".hg", ".env", ".ssh", "._macftpd_trash", "._macftpd_versions", "._macftpd_uploads"]
   },
   "auth": {
     "users_path": "${REMOTE_DIR}/var/users.json",
@@ -87,14 +93,43 @@ scp "${SSH_OPTS[@]}" dist/macftpd "${REMOTE}:${REMOTE_DIR}/bin/macftpd.new"
 scp "${SSH_OPTS[@]}" "${tmp_config}" "${REMOTE}:${REMOTE_DIR}/config.json.new"
 rm -f "${tmp_config}"
 
-ssh "${SSH_OPTS[@]}" "${REMOTE}" "REMOTE_DIR='${REMOTE_DIR}' START_MODE='${START_MODE}' bash -s" <<'SH'
+ssh "${SSH_OPTS[@]}" "${REMOTE}" "REMOTE_DIR='${REMOTE_DIR}' START_MODE='${START_MODE}' MACFTPD_CODESIGN_IDENTITY='${MACFTPD_CODESIGN_IDENTITY}' MACFTPD_CODESIGN_KEYCHAIN='${MACFTPD_CODESIGN_KEYCHAIN}' MACFTPD_CODESIGN_KEYCHAIN_PASS_FILE='${MACFTPD_CODESIGN_KEYCHAIN_PASS_FILE}' bash -s" <<'SH'
 set -euo pipefail
 REMOTE_DIR="${REMOTE_DIR:-/opt/macftpd}"
+sign_macftpd() {
+  local binary="$1"
+  if ! command -v codesign >/dev/null 2>&1; then
+    return 0
+  fi
+  local identity="${MACFTPD_CODESIGN_IDENTITY:-}"
+  local keychain="${MACFTPD_CODESIGN_KEYCHAIN:-}"
+  local pass_file="${MACFTPD_CODESIGN_KEYCHAIN_PASS_FILE:-}"
+  local keychain_args=()
+  if [[ -n "${keychain}" ]]; then
+    keychain_args=(--keychain "${keychain}")
+    if [[ -n "${pass_file}" && -f "${pass_file}" ]]; then
+      security unlock-keychain -p "$(cat "${pass_file}")" "${keychain}" >/dev/null 2>&1 || true
+    fi
+  fi
+  if [[ -z "${identity}" && -n "${keychain}" ]]; then
+    identity="$(security find-identity -v -p codesigning "${keychain}" 2>/dev/null | awk -F '"' '/"/ {print $2; exit}')"
+  fi
+  if [[ -n "${identity}" ]]; then
+    if codesign --force --sign "${identity}" "${keychain_args[@]}" --identifier org.rememe.macftpd "${binary}"; then
+      return 0
+    fi
+    echo "warning: stable codesign identity failed; falling back to ad-hoc signing" >&2
+  else
+    echo "warning: no stable codesign identity configured; ad-hoc signing may retrigger macOS removable-volume prompts after each upgrade" >&2
+  fi
+  codesign --force --sign - --identifier org.rememe.macftpd "${binary}"
+}
 chmod 755 "${REMOTE_DIR}/bin/macftpd.new"
-mv "${REMOTE_DIR}/bin/macftpd.new" "${REMOTE_DIR}/bin/macftpd"
-if command -v codesign >/dev/null 2>&1; then
-  codesign --force --sign - --identifier org.rememe.macftpd "${REMOTE_DIR}/bin/macftpd"
+if [[ -f "${REMOTE_DIR}/bin/macftpd" ]]; then
+  cp "${REMOTE_DIR}/bin/macftpd" "${REMOTE_DIR}/bin/macftpd.prev.$(date -u +%Y%m%dT%H%M%SZ)"
 fi
+mv "${REMOTE_DIR}/bin/macftpd.new" "${REMOTE_DIR}/bin/macftpd"
+sign_macftpd "${REMOTE_DIR}/bin/macftpd"
 if [[ ! -f "${REMOTE_DIR}/config.json" ]]; then
   mv "${REMOTE_DIR}/config.json.new" "${REMOTE_DIR}/config.json"
 else
@@ -118,6 +153,8 @@ for section, keys in {
         for key in keys:
             if old[section].get(key) not in ("", None):
                 new[section][key] = old[section][key]
+if not new.get("http", {}).get("public_base_url") and old.get("http", {}).get("public_base_url"):
+    new["http"]["public_base_url"] = old["http"]["public_base_url"]
 with open(out_path, "w") as f:
     json.dump(new, f, indent=2)
     f.write("\n")

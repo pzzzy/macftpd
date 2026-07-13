@@ -10,6 +10,7 @@ import (
 	"log"
 	"net"
 	"os"
+	"path/filepath"
 	"strconv"
 	"strings"
 	"sync"
@@ -45,6 +46,7 @@ type Server struct {
 	activity    *activity.Store
 	tracker     *status.Tracker
 	tlsConfig   *tls.Config
+	publicHook  func(string)
 	readNoiseMu sync.Mutex
 	readNoise   map[string]readNoiseEvent
 }
@@ -83,6 +85,9 @@ func New(cfg config.FTPConfig, store *auth.Store, root *storage.Root, activityLo
 	ports, err := parsePorts(cfg.PassivePorts)
 	if err != nil {
 		return nil, err
+	}
+	if cfg.RequireTLS && (cfg.TLSCertFile == "" || cfg.TLSKeyFile == "") {
+		return nil, errors.New("ftp.require_tls requires ftp.tls_cert_file and ftp.tls_key_file")
 	}
 	var tlsConfig *tls.Config
 	if cfg.TLSCertFile != "" || cfg.TLSKeyFile != "" {
@@ -148,6 +153,18 @@ func (s *Server) Addr() string {
 		return s.cfg.Listen
 	}
 	return s.localAddr
+}
+
+// SetPublicMutationHook registers a best-effort cache invalidation hook. The
+// callback should return quickly; mutation success does not depend on it.
+func (s *Server) SetPublicMutationHook(hook func(string)) {
+	s.publicHook = hook
+}
+
+func (s *Server) notifyPublicMutation(realPath, virtual string) {
+	if s.publicHook != nil && s.root.IsPublicReal(realPath) {
+		s.publicHook(virtual)
+	}
 }
 
 func (s *Server) logReadError(addr net.Addr, err error) {
@@ -282,7 +299,9 @@ func (s *session) dispatch(cmd, arg string) bool {
 		if s.cwd == "" {
 			s.cwd = "/"
 		}
-		_ = s.server.root.EnsureUserHome(user)
+		if s.cwd != "/" {
+			_ = s.server.root.EnsureUserHome(user)
+		}
 		s.updateStatus(func(st *status.Session) {
 			st.User = user.Username
 			st.Action = "idle"
@@ -330,12 +349,12 @@ func (s *session) dispatch(cmd, arg string) bool {
 		}
 		s.reply(257, fmt.Sprintf("\"%s\" is current directory", s.cwd))
 	case "CWD":
-		if !s.requireAuthPerm(s.perms.List, "list") {
+		if !s.requireAuthPerm("list") {
 			return false
 		}
 		s.changeDir(arg)
 	case "CDUP":
-		if !s.requireAuthPerm(s.perms.List, "list") {
+		if !s.requireAuthPerm("list") {
 			return false
 		}
 		s.changeDir("..")
@@ -374,27 +393,27 @@ func (s *session) dispatch(cmd, arg string) bool {
 		}
 		s.enterExtendedActive(arg)
 	case "LIST", "NLST":
-		if !s.requireAuthPerm(s.perms.List, "list") {
+		if !s.requireAuthPerm("list") {
 			return false
 		}
 		s.list(arg, cmd == "NLST")
 	case "MLSD":
-		if !s.requireAuthPerm(s.perms.List, "list") {
+		if !s.requireAuthPerm("list") {
 			return false
 		}
 		s.mlsd(arg)
 	case "MLST":
-		if !s.requireAuthPerm(s.perms.List, "list") {
+		if !s.requireAuthPerm("list") {
 			return false
 		}
 		s.mlst(arg)
 	case "RETR":
-		if !s.requireAuthPerm(s.perms.Download, "download") {
+		if !s.requireAuthPerm("download") {
 			return false
 		}
 		s.retrieve(arg)
 	case "STOR", "APPE":
-		if !s.requireAuthPerm(s.perms.Upload, "upload") {
+		if !s.requireAuthPerm("upload") {
 			return false
 		}
 		s.store(arg, cmd == "APPE")
@@ -404,37 +423,37 @@ func (s *session) dispatch(cmd, arg string) bool {
 		}
 		s.restart(arg)
 	case "DELE":
-		if !s.requireAuthPerm(s.perms.Delete, "delete") {
+		if !s.requireAuthPerm("delete") {
 			return false
 		}
 		s.delete(arg)
 	case "MKD", "XMKD":
-		if !s.requireAuthPerm(s.perms.Mkdir, "mkdir") {
+		if !s.requireAuthPerm("mkdir") {
 			return false
 		}
 		s.mkdir(arg)
 	case "RMD", "XRMD":
-		if !s.requireAuthPerm(s.perms.Delete, "delete") {
+		if !s.requireAuthPerm("delete") {
 			return false
 		}
 		s.rmdir(arg)
 	case "RNFR":
-		if !s.requireAuthPerm(s.perms.Rename, "rename") {
+		if !s.requireAuthPerm("rename") {
 			return false
 		}
 		s.renameFromPath(arg)
 	case "RNTO":
-		if !s.requireAuthPerm(s.perms.Rename, "rename") {
+		if !s.requireAuthPerm("rename") {
 			return false
 		}
 		s.renameToPath(arg)
 	case "SIZE":
-		if !s.requireAuthPerm(s.perms.Download, "download") {
+		if !s.requireAuthPerm("download") {
 			return false
 		}
 		s.size(arg)
 	case "MDTM":
-		if !s.requireAuthPerm(s.perms.Download, "download") {
+		if !s.requireAuthPerm("download") {
 			return false
 		}
 		s.mdtm(arg)
@@ -654,22 +673,20 @@ func (s *session) store(arg string, appendMode bool) {
 		s.reply(550, "Cannot create directory")
 		return
 	}
-	flag := os.O_WRONLY | os.O_CREATE
-	if appendMode {
-		flag |= os.O_APPEND
-	} else if restarting && offset > 0 {
-		flag = os.O_WRONLY
-	} else {
-		flag |= os.O_TRUNC
+	info, statErr := s.server.root.Stat(realPath)
+	exists := statErr == nil
+	if exists && info.IsDir() {
+		s.closeDataSetup()
+		s.reply(550, "Destination is a directory")
+		return
 	}
-	if !appendMode && !restarting {
-		if info, err := s.server.root.Stat(realPath); err == nil && !info.IsDir() {
-			_, _ = s.server.root.Version(realPath, virtual, s.user.Username)
-		}
+	if statErr != nil && !errors.Is(statErr, os.ErrNotExist) {
+		s.closeDataSetup()
+		s.reply(550, "Destination unavailable")
+		return
 	}
 	if restarting && offset > 0 {
-		info, err := s.server.root.Stat(realPath)
-		if err != nil || info.IsDir() {
+		if !exists {
 			s.closeDataSetup()
 			s.reply(550, "Resume target unavailable")
 			return
@@ -680,13 +697,38 @@ func (s *session) store(arg string, appendMode bool) {
 			return
 		}
 	}
-	file, err := s.server.root.OpenFile(realPath, flag, 0o640)
+	file, stagedPath, err := s.createStagedUpload()
 	if err != nil {
 		s.closeDataSetup()
-		s.reply(550, "Open failed")
+		s.reply(550, "Cannot stage upload")
 		return
 	}
-	defer file.Close()
+	defer func() {
+		_ = file.Close()
+		_ = s.server.root.Remove(stagedPath)
+	}()
+	if (appendMode || restarting) && exists {
+		current, err := s.server.root.Open(realPath)
+		if err != nil {
+			s.closeDataSetup()
+			s.reply(550, "Cannot read current file")
+			return
+		}
+		_, copyErr := io.Copy(file, current)
+		_ = current.Close()
+		if copyErr != nil {
+			s.closeDataSetup()
+			s.reply(550, "Cannot stage current file")
+			return
+		}
+	}
+	if appendMode {
+		if _, err := file.Seek(0, io.SeekEnd); err != nil {
+			s.closeDataSetup()
+			s.reply(550, "Append seek failed")
+			return
+		}
+	}
 	if restarting {
 		if _, err := file.Seek(offset, io.SeekStart); err != nil {
 			s.closeDataSetup()
@@ -720,12 +762,51 @@ func (s *session) store(arg string, appendMode bool) {
 		s.reply(426, "Transfer aborted")
 		return
 	}
+	if err := file.Close(); err != nil {
+		s.logActivity("upload", "failed", arg, "", n, err.Error())
+		s.reply(451, "Cannot finalize upload")
+		return
+	}
+	mode := os.FileMode(0o640)
+	if exists {
+		mode = info.Mode().Perm()
+	}
+	if err := s.server.root.Chmod(stagedPath, mode); err != nil {
+		s.logActivity("upload", "failed", arg, "", n, err.Error())
+		s.reply(451, "Cannot finalize upload permissions")
+		return
+	}
+	if err := s.server.root.ReplaceFile(stagedPath, realPath, virtual, s.user.Username, true); err != nil {
+		s.logActivity("upload", "failed", arg, "", n, err.Error())
+		s.reply(451, "Cannot preserve or replace destination")
+		return
+	}
+	s.server.notifyPublicMutation(realPath, virtual)
 	detail := "FTP upload"
 	if restarting {
 		detail = fmt.Sprintf("FTP upload resumed at offset %d", offset)
 	}
 	s.logActivity("upload", "ok", arg, "", n, detail)
 	s.reply(226, "Transfer complete")
+}
+
+func (s *session) createStagedUpload() (*os.File, string, error) {
+	dir := filepath.Join(s.server.root.Base, "._macftpd_uploads")
+	if err := s.server.root.MkdirAll(dir, 0o700); err != nil {
+		return nil, "", err
+	}
+	for attempt := 0; attempt < 10; attempt++ {
+		name := fmt.Sprintf("ftp-%d-%d-%d.part", s.statusID, time.Now().UnixNano(), attempt)
+		stagedPath := filepath.Join(dir, name)
+		file, err := s.server.root.OpenFile(stagedPath, os.O_CREATE|os.O_EXCL|os.O_RDWR, 0o600)
+		if err == nil {
+			return file, stagedPath, nil
+		}
+		if !errors.Is(err, os.ErrExist) {
+			return nil, "", err
+		}
+	}
+	return nil, "", errors.New("cannot allocate staged upload")
 }
 
 func (s *session) restart(arg string) {
@@ -770,10 +851,14 @@ func (s *session) delete(arg string) {
 		s.reply(250, "Deleted")
 		return
 	}
+	wasPublic := s.server.root.IsPublicReal(realPath)
 	if _, err := s.server.root.Trash(realPath, virtual, s.user.Username); err != nil {
 		s.logActivity("delete", "failed", arg, "", 0, err.Error())
 		s.reply(550, "Delete failed")
 		return
+	}
+	if wasPublic && s.server.publicHook != nil {
+		s.server.publicHook(virtual)
 	}
 	s.logActivity("delete", "ok", arg, "", 0, "FTP delete moved to trash")
 	s.reply(250, "Deleted")
@@ -790,6 +875,7 @@ func (s *session) mkdir(arg string) {
 		s.reply(550, "Create failed")
 		return
 	}
+	s.server.notifyPublicMutation(realPath, virtual)
 	s.logActivity("mkdir", "ok", virtual, "", 0, "FTP folder created")
 	s.reply(257, fmt.Sprintf("\"%s\" created", virtual))
 }
@@ -814,10 +900,14 @@ func (s *session) rmdir(arg string) {
 		s.reply(250, "Removed")
 		return
 	}
+	wasPublic := s.server.root.IsPublicReal(realPath)
 	if _, err := s.server.root.Trash(realPath, virtual, s.user.Username); err != nil {
 		s.logActivity("delete", "failed", arg, "", 0, err.Error())
 		s.reply(550, "Remove failed")
 		return
+	}
+	if wasPublic && s.server.publicHook != nil {
+		s.server.publicHook(virtual)
 	}
 	s.logActivity("delete", "ok", arg, "", 0, "FTP folder moved to trash")
 	s.reply(250, "Removed")
@@ -852,7 +942,7 @@ func (s *session) renameToPath(arg string) {
 		s.reply(503, "RNFR required")
 		return
 	}
-	realPath, _, err := s.server.root.Resolve(s.user, s.cwd, arg)
+	realPath, virtual, err := s.server.root.Resolve(s.user, s.cwd, arg)
 	if err != nil {
 		s.reply(550, "Path unavailable")
 		return
@@ -861,11 +951,15 @@ func (s *session) renameToPath(arg string) {
 		s.reply(550, "Permission denied: public files are admin-managed")
 		return
 	}
+	publicMutation := s.server.root.IsPublicReal(s.renameFrom) || s.server.root.IsPublicReal(realPath)
 	defer func() { s.renameFrom = "" }()
 	if err := s.server.root.Rename(s.renameFrom, realPath); err != nil {
 		s.logActivity("move", "failed", s.renameFrom, arg, 0, err.Error())
 		s.reply(550, "Rename failed")
 		return
+	}
+	if publicMutation && s.server.publicHook != nil {
+		s.server.publicHook(virtual)
 	}
 	s.logActivity("move", "ok", s.renameFrom, arg, 0, "FTP rename")
 	s.reply(250, "Renamed")
@@ -1239,17 +1333,23 @@ func (s *session) openData() (net.Conn, error) {
 		s.passivePort = 0
 		defer ln.Close()
 		_ = ln.(*net.TCPListener).SetDeadline(time.Now().Add(30 * time.Second))
-		conn, err := ln.Accept()
-		if err != nil {
-			if port > 0 {
-				s.releasePassivePort(port)
+		for {
+			conn, err := ln.Accept()
+			if err != nil {
+				if port > 0 {
+					s.releasePassivePort(port)
+				}
+				return nil, err
 			}
-			return nil, err
+			if !passivePeerAllowed(s.conn.RemoteAddr(), conn.RemoteAddr(), s.server.cfg.AllowFXP) {
+				_ = conn.Close()
+				continue
+			}
+			if port > 0 {
+				return &passiveDataConn{Conn: conn, release: func() { s.releasePassivePort(port) }}, nil
+			}
+			return conn, nil
 		}
-		if port > 0 {
-			return &passiveDataConn{Conn: conn, release: func() { s.releasePassivePort(port) }}, nil
-		}
-		return conn, nil
 	}
 	if s.activeAddr != "" {
 		addr := s.activeAddr
@@ -1319,12 +1419,37 @@ func (s *session) requireAuth() bool {
 		s.reply(530, "Please login")
 		return false
 	}
+	user, perms, ok := s.server.auth.Permissions(s.user.Username)
+	if !ok {
+		s.authenticated = false
+		s.perms = auth.PermissionSet{}
+		s.reply(530, "Account unavailable")
+		return false
+	}
+	user.Permissions = perms
+	s.user = user
+	s.perms = perms
 	return true
 }
 
-func (s *session) requireAuthPerm(ok bool, name string) bool {
+func (s *session) requireAuthPerm(name string) bool {
 	if !s.requireAuth() {
 		return false
+	}
+	var ok bool
+	switch name {
+	case "list":
+		ok = s.perms.List
+	case "download":
+		ok = s.perms.Download
+	case "upload":
+		ok = s.perms.Upload
+	case "delete":
+		ok = s.perms.Delete
+	case "mkdir":
+		ok = s.perms.Mkdir
+	case "rename":
+		ok = s.perms.Rename
 	}
 	if !ok {
 		s.reply(550, "Permission denied: "+name)
@@ -1497,4 +1622,8 @@ func sameHost(remote net.Addr, host string) bool {
 		ip = ips[0]
 	}
 	return tcp.IP.Equal(ip)
+}
+
+func passivePeerAllowed(control, data net.Addr, allowFXP bool) bool {
+	return allowFXP || sameHost(control, remoteHost(data))
 }

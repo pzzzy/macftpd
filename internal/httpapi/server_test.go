@@ -3,6 +3,7 @@ package httpapi
 import (
 	"bytes"
 	"encoding/json"
+	"html/template"
 	"mime/multipart"
 	"net/http"
 	"net/http/httptest"
@@ -11,6 +12,7 @@ import (
 	"strconv"
 	"strings"
 	"testing"
+	"time"
 
 	"macftpd/internal/activity"
 	"macftpd/internal/auth"
@@ -19,6 +21,57 @@ import (
 	"macftpd/internal/share"
 	"macftpd/internal/storage"
 )
+
+func TestHTTPServerTimeoutsProtectHeadersWithoutCappingStreams(t *testing.T) {
+	srv := testServer(t)
+	built := srv.newHTTPServer(http.NewServeMux())
+	if built.ReadHeaderTimeout != 10*time.Second || built.IdleTimeout != 60*time.Second {
+		t.Fatalf("default header/idle timeouts = %s/%s", built.ReadHeaderTimeout, built.IdleTimeout)
+	}
+	if built.ReadTimeout != 0 || built.WriteTimeout != 0 {
+		t.Fatalf("streaming body deadlines must default off, got read=%s write=%s", built.ReadTimeout, built.WriteTimeout)
+	}
+
+	srv.cfg.ReadHeaderTimeout = config.Duration(2 * time.Second)
+	srv.cfg.ReadTimeout = config.Duration(3 * time.Second)
+	srv.cfg.WriteTimeout = config.Duration(4 * time.Second)
+	srv.cfg.IdleTimeout = config.Duration(5 * time.Second)
+	built = srv.newHTTPServer(http.NewServeMux())
+	if built.ReadHeaderTimeout != 2*time.Second || built.ReadTimeout != 3*time.Second || built.WriteTimeout != 4*time.Second || built.IdleTimeout != 5*time.Second {
+		t.Fatalf("explicit HTTP timeouts were not preserved: %#v", built)
+	}
+}
+
+func TestTinyTailProbeDoesNotCountAsCompletedLargeDownload(t *testing.T) {
+	const size = int64(10_824_083_788)
+	tinyTail := fileServeResult{Status: http.StatusPartialContent, Bytes: 122_704, Size: size, Method: http.MethodGet, Range: "bytes=10823961084-"}
+	if tinyTail.RecordableDownload() {
+		t.Fatal("tiny media tail probe counted as a completed large download")
+	}
+	completedResume := fileServeResult{Status: http.StatusPartialContent, Bytes: 168_078_615, Size: size, Method: http.MethodGet, Range: "bytes=10656005173-"}
+	if !completedResume.RecordableDownload() {
+		t.Fatal("substantial resume through EOF was not counted as a completed download")
+	}
+}
+
+func TestAdminFilesURLRemainsSafeInTemplateURLContext(t *testing.T) {
+	tmpl := template.Must(template.New("url").Funcs(templateFuncs()).Parse(`<a hx-push-url="{{adminFilesURL .Path .Selected}}">open</a>`))
+	var rendered strings.Builder
+	err := tmpl.Execute(&rendered, map[string]string{
+		"Path":     `/public/a" onclick="alert(1)`,
+		"Selected": `</a><script>alert(1)</script>`,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	output := rendered.String()
+	if strings.Contains(output, "<script") || strings.Contains(output, "onclick=") || strings.Contains(output, "#ZgotmplZ") {
+		t.Fatalf("unsafe admin files URL rendering: %s", output)
+	}
+	if !strings.Contains(output, "%3Cscript%3E") {
+		t.Fatalf("selected path was not URL-encoded: %s", output)
+	}
+}
 
 func TestPublicFileHeadersAndDirectoryListing(t *testing.T) {
 	srv := testServer(t)
@@ -157,6 +210,68 @@ func TestAdminFileActionCopyMoveAndActivity(t *testing.T) {
 	}
 }
 
+func TestActivityDashboardSuppressesMonitorAndSeparatesSecurity(t *testing.T) {
+	srv := testServer(t)
+	srv.activity.Add(activity.Event{Type: "ftp_login", Protocol: "ftp", Actor: "admin", Remote: "127.0.0.1:50000", Action: "login", Path: "/", Detail: "FTP login"})
+	srv.activity.Add(activity.Event{Type: "ftp_upload", Protocol: "ftp", Actor: "admin", Remote: "127.0.0.1:50000", Action: "upload", Path: "_monitor/probe.txt", Bytes: 12, Detail: "FTP upload"})
+	srv.activity.Add(activity.Event{Type: "ftp_delete", Protocol: "ftp", Actor: "admin", Remote: "127.0.0.1:50000", Action: "delete", Path: "_monitor/probe.txt", Detail: "FTP monitor cleanup removed permanently"})
+	srv.activity.Add(activity.Event{Type: "ftp_login", Protocol: "ftp", Actor: "anonymous", Remote: "203.0.113.10:4444", Action: "login", Outcome: "failed", Detail: "bad FTP credentials"})
+	srv.activity.Add(activity.Event{Type: "http_login", Protocol: "http", Actor: "admin", Remote: "127.0.0.1:60000", Action: "login", Outcome: "failed", Path: "/admin/", Detail: "admin auth failed"})
+	srv.activity.Add(activity.Event{Type: "http_login", Protocol: "http", Actor: "admin", Remote: "127.0.0.1:60001", Action: "login", Outcome: "failed", Path: "/api/activity", Detail: "admin auth failed"})
+	srv.activity.Add(activity.Event{Type: "admin_file", Protocol: "http", Actor: "admin", Remote: "127.0.0.1:60000", Action: "download", Path: "/public/readme.txt", Detail: "admin download"})
+
+	req := httptest.NewRequest(http.MethodGet, "/api/activity?limit=20", nil)
+	req.SetBasicAuth("admin", "secret")
+	rr := httptest.NewRecorder()
+	srv.requireAdmin(srv.activityFeed)(rr, req)
+	if rr.Code != http.StatusOK {
+		t.Fatalf("activity status = %d body=%s", rr.Code, rr.Body.String())
+	}
+	var body struct {
+		Events           []activity.Event `json:"events"`
+		ExternalFailures []activity.Event `json:"external_failures"`
+		AdminMistakes    []activity.Event `json:"admin_mistakes"`
+		Monitor          struct {
+			Count int `json:"count"`
+			OK    int `json:"ok"`
+		} `json:"monitor"`
+	}
+	if err := json.Unmarshal(rr.Body.Bytes(), &body); err != nil {
+		t.Fatalf("decode activity response: %v", err)
+	}
+	if body.Monitor.Count != 3 || body.Monitor.OK != 3 {
+		t.Fatalf("unexpected monitor summary: %#v", body.Monitor)
+	}
+	for _, event := range body.Events {
+		if strings.Contains(event.Path, "_monitor") || strings.Contains(event.Detail, "monitor") || event.Message == "admin login /" || event.Path == "/api/activity" {
+			t.Fatalf("monitor event leaked into human feed: %#v", event)
+		}
+	}
+	if len(body.ExternalFailures) != 1 || body.ExternalFailures[0].Remote != "203.0.113.10:4444" {
+		t.Fatalf("unexpected external failures: %#v", body.ExternalFailures)
+	}
+	if len(body.AdminMistakes) != 1 || body.AdminMistakes[0].Path != "/admin/" {
+		t.Fatalf("unexpected admin mistakes: %#v", body.AdminMistakes)
+	}
+
+	req = httptest.NewRequest(http.MethodGet, "/admin/partials/activity", nil)
+	req.SetBasicAuth("admin", "secret")
+	rr = httptest.NewRecorder()
+	srv.requireAdmin(srv.adminActivityPartial)(rr, req)
+	if rr.Code != http.StatusOK {
+		t.Fatalf("partial status = %d body=%s", rr.Code, rr.Body.String())
+	}
+	rendered := rr.Body.String()
+	for _, needle := range []string{"Security and Events", "External Failures", "Admin and User Mistakes", "Monitor Checks", "total 3"} {
+		if !strings.Contains(rendered, needle) {
+			t.Fatalf("activity partial missing %q: %s", needle, rendered)
+		}
+	}
+	if strings.Contains(rendered, "_monitor/probe.txt") {
+		t.Fatalf("activity partial leaked monitor path: %s", rendered)
+	}
+}
+
 func TestUploadRejectsIgnoredDestination(t *testing.T) {
 	srv := testServer(t)
 	var body bytes.Buffer
@@ -242,6 +357,91 @@ func TestChunkedUploadAssemblesAndVersions(t *testing.T) {
 	}
 }
 
+func TestChunkedUploadRejectsExcessBeforeGrowingPart(t *testing.T) {
+	srv := testServer(t)
+	send := func(data string) *httptest.ResponseRecorder {
+		var body bytes.Buffer
+		mw := multipart.NewWriter(&body)
+		for key, value := range map[string]string{
+			"path":       "/public",
+			"filename":   "bounded.bin",
+			"upload_id":  "bounded-upload-1234",
+			"offset":     "0",
+			"total_size": "3",
+		} {
+			if err := mw.WriteField(key, value); err != nil {
+				t.Fatal(err)
+			}
+		}
+		part, err := mw.CreateFormFile("chunk", "bounded.bin")
+		if err != nil {
+			t.Fatal(err)
+		}
+		if _, err := part.Write([]byte(data)); err != nil {
+			t.Fatal(err)
+		}
+		if err := mw.Close(); err != nil {
+			t.Fatal(err)
+		}
+		req := httptest.NewRequest(http.MethodPost, "/api/upload/chunk", &body)
+		req.SetBasicAuth("admin", "secret")
+		req.Header.Set("Content-Type", mw.FormDataContentType())
+		rr := httptest.NewRecorder()
+		srv.requireAdmin(srv.uploadChunk)(rr, req)
+		return rr
+	}
+
+	rr := send("abcdef")
+	if rr.Code != http.StatusBadRequest || !strings.Contains(rr.Body.String(), "chunk exceeds total size") {
+		t.Fatalf("oversized chunk status=%d body=%s", rr.Code, rr.Body.String())
+	}
+	parts, err := os.ReadDir(srv.root.Base + "/._macftpd_uploads")
+	if err != nil || len(parts) != 1 {
+		t.Fatalf("part directory entries=%d err=%v", len(parts), err)
+	}
+	info, err := parts[0].Info()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if info.Size() != 0 {
+		t.Fatalf("oversized part retained %d bytes", info.Size())
+	}
+
+	rr = send("abc")
+	if rr.Code != http.StatusOK {
+		t.Fatalf("valid retry status=%d body=%s", rr.Code, rr.Body.String())
+	}
+	raw, err := os.ReadFile(srv.root.Base + "/public/bounded.bin")
+	if err != nil || string(raw) != "abc" {
+		t.Fatalf("bounded upload payload=%q err=%v", raw, err)
+	}
+}
+
+func TestCleanupUploadPartsRemovesOnlyStaleParts(t *testing.T) {
+	dir := t.TempDir()
+	oldPart := dir + "/old.part"
+	newPart := dir + "/new.part"
+	other := dir + "/keep.txt"
+	for _, name := range []string{oldPart, newPart, other} {
+		if err := os.WriteFile(name, []byte("x"), 0o600); err != nil {
+			t.Fatal(err)
+		}
+	}
+	oldTime := time.Now().Add(-25 * time.Hour)
+	if err := os.Chtimes(oldPart, oldTime, oldTime); err != nil {
+		t.Fatal(err)
+	}
+	cleanupUploadParts(dir, time.Now().Add(-24*time.Hour))
+	if _, err := os.Stat(oldPart); !os.IsNotExist(err) {
+		t.Fatalf("stale part still exists: %v", err)
+	}
+	for _, name := range []string{newPart, other} {
+		if _, err := os.Stat(name); err != nil {
+			t.Fatalf("fresh/non-part file removed: %s: %v", name, err)
+		}
+	}
+}
+
 func TestShareLinkServesBareFileWithStatsAndExpiry(t *testing.T) {
 	srv := testServer(t)
 	name := "[1997-06-28] Glastonbury.MP4"
@@ -272,6 +472,127 @@ func TestShareLinkServesBareFileWithStatsAndExpiry(t *testing.T) {
 	stats := srv.activity.StatsForPath("/public/"+name, 10)
 	if stats.Downloads != 1 || stats.Referrers["https://example.test/page"] != 1 {
 		t.Fatalf("bad stats %#v", stats)
+	}
+}
+
+func TestShareLinkRangeDownloadHeadersAndAccounting(t *testing.T) {
+	srv := testServer(t)
+	name := "movie.mkv"
+	if err := os.WriteFile(srv.root.Base+"/public/"+name, []byte("0123456789"), 0o640); err != nil {
+		t.Fatal(err)
+	}
+	created, err := srv.links.Create(share.CreateRequest{Kind: share.KindDownload, Path: "/public/" + name, CreatedBy: "admin", MaxDownloads: 1})
+	if err != nil {
+		t.Fatal(err)
+	}
+	sharePath := "/s/" + created.Link.ID + "/" + created.Token + "/" + url.PathEscape(name)
+	req := httptest.NewRequest(http.MethodGet, sharePath, nil)
+	req.Header.Set("Range", "bytes=2-5")
+	rr := httptest.NewRecorder()
+	srv.shareLink(rr, req)
+	if rr.Code != http.StatusPartialContent || rr.Body.String() != "2345" {
+		t.Fatalf("range status=%d body=%q", rr.Code, rr.Body.String())
+	}
+	for _, tc := range []struct {
+		header string
+		want   string
+	}{
+		{"Accept-Ranges", "bytes"},
+		{"Cloudflare-CDN-Cache-Control", "no-store"},
+		{"CDN-Cache-Control", "no-store"},
+	} {
+		if got := rr.Header().Get(tc.header); got != tc.want {
+			t.Fatalf("%s = %q, want %q", tc.header, got, tc.want)
+		}
+	}
+	if got := rr.Header().Get("Cache-Control"); !strings.Contains(got, "no-store") || !strings.Contains(got, "no-transform") {
+		t.Fatalf("bad Cache-Control %q", got)
+	}
+	if got := rr.Header().Get("Content-Range"); got != "bytes 2-5/10" {
+		t.Fatalf("bad Content-Range %q", got)
+	}
+	stats := srv.activity.StatsForPath("/public/"+name, 10)
+	if stats.Downloads != 0 || len(stats.Recent) != 0 {
+		t.Fatalf("bounded range probe counted as a completed download: %#v", stats)
+	}
+	events := srv.activity.Recent(10, 0)
+	if len(events) == 0 || events[0].Action != "download_probe" || events[0].Bytes != 4 || !strings.Contains(events[0].Detail, "status=206") || !strings.Contains(events[0].Detail, "range=bytes=2-5") {
+		t.Fatalf("range probe diagnostic event missing: %#v", events)
+	}
+	publicLink, err := srv.links.Public(created.Link.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if publicLink.DownloadCount != 0 {
+		t.Fatalf("bounded probe range consumed download count: %#v", publicLink)
+	}
+
+	req = httptest.NewRequest(http.MethodGet, sharePath, nil)
+	rr = httptest.NewRecorder()
+	srv.shareLink(rr, req)
+	if rr.Code != http.StatusOK || rr.Body.String() != "0123456789" {
+		t.Fatalf("full download status=%d body=%q", rr.Code, rr.Body.String())
+	}
+	stats = srv.activity.StatsForPath("/public/"+name, 10)
+	if stats.Downloads != 1 || len(stats.Recent) != 1 || stats.Recent[0].Bytes != 10 {
+		t.Fatalf("full response was not counted once: %#v", stats)
+	}
+	req = httptest.NewRequest(http.MethodGet, sharePath, nil)
+	rr = httptest.NewRecorder()
+	srv.shareLink(rr, req)
+	if rr.Code != http.StatusGone {
+		t.Fatalf("one-download link should be gone after full response, got %d", rr.Code)
+	}
+}
+
+func TestShareLinkResumeRangeToEOFConsumesOneDownload(t *testing.T) {
+	srv := testServer(t)
+	name := "resume.bin"
+	if err := os.WriteFile(srv.root.Base+"/public/"+name, []byte("0123456789"), 0o640); err != nil {
+		t.Fatal(err)
+	}
+	created, err := srv.links.Create(share.CreateRequest{Kind: share.KindDownload, Path: "/public/" + name, CreatedBy: "admin", MaxDownloads: 1})
+	if err != nil {
+		t.Fatal(err)
+	}
+	sharePath := "/s/" + created.Link.ID + "/" + created.Token + "/" + url.PathEscape(name)
+	req := httptest.NewRequest(http.MethodGet, sharePath, nil)
+	req.Header.Set("Range", "bytes=5-")
+	rr := httptest.NewRecorder()
+	srv.shareLink(rr, req)
+	if rr.Code != http.StatusPartialContent || rr.Body.String() != "56789" {
+		t.Fatalf("resume status=%d body=%q", rr.Code, rr.Body.String())
+	}
+	req = httptest.NewRequest(http.MethodGet, sharePath, nil)
+	rr = httptest.NewRecorder()
+	srv.shareLink(rr, req)
+	if rr.Code != http.StatusGone {
+		t.Fatalf("resume-to-eof should consume one-download link, got %d", rr.Code)
+	}
+}
+
+func TestShareLinkEmptyFileConsumesOneDownload(t *testing.T) {
+	srv := testServer(t)
+	name := "empty.txt"
+	if err := os.WriteFile(srv.root.Base+"/public/"+name, nil, 0o640); err != nil {
+		t.Fatal(err)
+	}
+	created, err := srv.links.Create(share.CreateRequest{Kind: share.KindDownload, Path: "/public/" + name, CreatedBy: "admin", MaxDownloads: 1})
+	if err != nil {
+		t.Fatal(err)
+	}
+	sharePath := "/s/" + created.Link.ID + "/" + created.Token + "/" + url.PathEscape(name)
+	req := httptest.NewRequest(http.MethodGet, sharePath, nil)
+	rr := httptest.NewRecorder()
+	srv.shareLink(rr, req)
+	if rr.Code != http.StatusOK || rr.Body.Len() != 0 {
+		t.Fatalf("empty download status=%d body=%q", rr.Code, rr.Body.String())
+	}
+	req = httptest.NewRequest(http.MethodGet, sharePath, nil)
+	rr = httptest.NewRecorder()
+	srv.shareLink(rr, req)
+	if rr.Code != http.StatusGone {
+		t.Fatalf("empty file should consume one-download link, got %d", rr.Code)
 	}
 }
 
@@ -353,6 +674,66 @@ func TestPasswordProtectedDropPasswordFormSetsCookie(t *testing.T) {
 	}
 	if rr.Header().Get("Set-Cookie") == "" {
 		t.Fatal("password form did not set share cookie")
+	}
+}
+
+func TestSharePasswordAttemptsAreRateLimited(t *testing.T) {
+	srv := testServer(t)
+	if err := os.WriteFile(srv.root.Base+"/public/protected.txt", []byte("secret"), 0o640); err != nil {
+		t.Fatal(err)
+	}
+	created, err := srv.links.Create(share.CreateRequest{Kind: share.KindDownload, Path: "/public/protected.txt", CreatedBy: "admin", Password: "correct"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	sharePath := "/s/" + created.Link.ID + "/" + created.Token
+	for attempt := 0; attempt < 5; attempt++ {
+		req := httptest.NewRequest(http.MethodPost, sharePath, strings.NewReader("password=wrong"))
+		req.RemoteAddr = "203.0.113.44:40000"
+		req.Header.Set("Content-Type", "application/x-www-form-urlencoded")
+		rr := httptest.NewRecorder()
+		srv.shareLink(rr, req)
+		if rr.Code != http.StatusOK || !strings.Contains(rr.Body.String(), "Protected share") {
+			t.Fatalf("attempt %d status=%d body=%s", attempt+1, rr.Code, rr.Body.String())
+		}
+	}
+	req := httptest.NewRequest(http.MethodPost, sharePath, strings.NewReader("password=correct"))
+	req.RemoteAddr = "203.0.113.44:40000"
+	req.Header.Set("Content-Type", "application/x-www-form-urlencoded")
+	rr := httptest.NewRecorder()
+	srv.shareLink(rr, req)
+	if rr.Code != http.StatusTooManyRequests {
+		t.Fatalf("expected protected share rate limit, got %d body=%s", rr.Code, rr.Body.String())
+	}
+}
+
+func TestProtectedDropRejectsMultipartBeforeAuthorization(t *testing.T) {
+	srv := testServer(t)
+	created, err := srv.links.Create(share.CreateRequest{Kind: share.KindUpload, Path: "/public", CreatedBy: "admin", Password: "correct"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	var body bytes.Buffer
+	mw := multipart.NewWriter(&body)
+	part, err := mw.CreateFormFile("file", "blocked.txt")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := part.Write([]byte("blocked")); err != nil {
+		t.Fatal(err)
+	}
+	if err := mw.Close(); err != nil {
+		t.Fatal(err)
+	}
+	req := httptest.NewRequest(http.MethodPost, "/d/"+created.Link.ID+"/"+created.Token, &body)
+	req.Header.Set("Content-Type", mw.FormDataContentType())
+	rr := httptest.NewRecorder()
+	srv.dropLink(rr, req)
+	if rr.Code != http.StatusUnauthorized {
+		t.Fatalf("unauthorized multipart status=%d body=%s", rr.Code, rr.Body.String())
+	}
+	if _, err := os.Stat(srv.root.Base + "/public/blocked.txt"); !os.IsNotExist(err) {
+		t.Fatalf("unauthorized drop wrote a file: %v", err)
 	}
 }
 

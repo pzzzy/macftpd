@@ -53,6 +53,17 @@ func (c *Client) PurgeFiles(ctx context.Context, files []string) error {
 	return c.post(ctx, body)
 }
 
+// PurgeTag invalidates every cached public response carrying the configured
+// macftpd cache tag. It is suitable for FTP mutations, which have no HTTP URL
+// available for an exact-file purge.
+func (c *Client) PurgeTag(ctx context.Context) error {
+	if !c.Enabled() || c.cfg.CacheTag == "" {
+		return ErrNotConfigured
+	}
+	body := map[string][]string{"tags": {c.cfg.CacheTag}}
+	return c.post(ctx, body)
+}
+
 func (c *Client) post(ctx context.Context, body any) error {
 	raw, err := json.Marshal(body)
 	if err != nil {

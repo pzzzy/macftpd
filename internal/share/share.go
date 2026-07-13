@@ -77,9 +77,10 @@ type Created struct {
 }
 
 type Store struct {
-	mu    sync.RWMutex
-	path  string
-	links map[string]Link
+	mu              sync.RWMutex
+	path            string
+	links           map[string]Link
+	activeDownloads map[string]int
 }
 
 var (
@@ -90,7 +91,7 @@ var (
 )
 
 func Open(path string) (*Store, error) {
-	s := &Store{path: path, links: map[string]Link{}}
+	s := &Store{path: path, links: map[string]Link{}, activeDownloads: map[string]int{}}
 	if err := s.load(); err != nil {
 		return nil, err
 	}
@@ -221,9 +222,35 @@ func (s *Store) VerifyAuthorized(id, token string) (PublicLink, error) {
 	return public(link), nil
 }
 
-func (s *Store) RecordDownload(id string) error {
+func (s *Store) ReserveDownload(id string) error {
 	s.mu.Lock()
 	defer s.mu.Unlock()
+	link, ok := s.links[id]
+	if !ok {
+		return ErrNotFound
+	}
+	if err := available(link, s.activeDownloads[id]); err != nil {
+		return err
+	}
+	s.activeDownloads[id]++
+	return nil
+}
+
+func (s *Store) FinishDownload(id string, completed bool) error {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	active := s.activeDownloads[id]
+	if active <= 0 {
+		return errors.New("download was not reserved")
+	}
+	if active == 1 {
+		delete(s.activeDownloads, id)
+	} else {
+		s.activeDownloads[id] = active - 1
+	}
+	if !completed {
+		return nil
+	}
 	link, ok := s.links[id]
 	if !ok {
 		return ErrNotFound
@@ -235,20 +262,27 @@ func (s *Store) RecordDownload(id string) error {
 }
 
 func validate(link Link, token, password string, passwordAlreadyVerified bool) error {
-	if link.Disabled {
-		return ErrDisabled
-	}
-	if !link.ExpiresAt.IsZero() && time.Now().After(link.ExpiresAt) {
-		return ErrExpired
-	}
-	if link.MaxDownloads > 0 && link.DownloadCount >= link.MaxDownloads {
-		return ErrExpired
+	if err := available(link, 0); err != nil {
+		return err
 	}
 	if subtle.ConstantTimeCompare([]byte(hashToken(token)), []byte(link.TokenHash)) != 1 {
 		return ErrDenied
 	}
 	if link.PasswordHash != "" && !passwordAlreadyVerified && !auth.VerifyPassword(link.PasswordHash, password) {
 		return ErrDenied
+	}
+	return nil
+}
+
+func available(link Link, activeDownloads int) error {
+	if link.Disabled {
+		return ErrDisabled
+	}
+	if !link.ExpiresAt.IsZero() && time.Now().After(link.ExpiresAt) {
+		return ErrExpired
+	}
+	if link.MaxDownloads > 0 && link.DownloadCount+activeDownloads >= link.MaxDownloads {
+		return ErrExpired
 	}
 	return nil
 }

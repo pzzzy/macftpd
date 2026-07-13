@@ -87,6 +87,8 @@ Use this checklist against the remote Mac long-term test instance.
 - `GET /api/files?path=/` lists storage entries.
 - `POST /api/upload` uploads a multipart file.
 - `POST /api/upload/chunk` uploads large admin files in chunks and assembles them atomically.
+- Interrupt a multipart, chunked, drop-link, or remote-pull upload and confirm the destination is unchanged and the partial data remains outside the visible namespace.
+- Block `._macftpd_versions`, attempt to overwrite an existing file, and confirm the request fails while the original bytes remain intact.
 - `POST /api/files/action` copies or moves files and folders, including copy/move into `/public`.
 - `GET /api/shares` lists active links with persisted URL paths for newly-created links.
 - `DELETE /api/shares/<id>` revokes a link before expiry.
@@ -130,6 +132,7 @@ Use this checklist against the remote Mac long-term test instance.
 - Create and open a `https://ftp.example.com/s/...` direct share; confirm it bypasses admin auth and uses the correct MIME/disposition.
 - Create and use a `https://ftp.example.com/d/...` protected drop; confirm password form, cookie, chunked upload, and public URL behavior.
 - Confirm public responses include CDN cache headers.
+- Warm a public object and directory listing, mutate the object through HTTP and FTP, and confirm the next requests do not return the stale cached object/listing.
 - Confirm `/admin/`, `/api/*`, and `/healthz` include `Cache-Control: no-store` through the Worker.
 - Confirm a write with `Origin: https://evil.example` still returns `403`.
 - Confirm `macftpd-cloudflared` screen remains attached to the `macftpd-tunnel` tunnel.
@@ -146,6 +149,15 @@ Use this checklist against the remote Mac long-term test instance.
 - Confirm pulled file can be downloaded over FTP.
 - Confirm invalid remote credentials fail without creating a partial file.
 
+## Large MKV Regression
+
+- Stream a file larger than 10 GiB with `http.read_timeout` and `http.write_timeout` set to `0s`; confirm it completes without a 60-second server deadline.
+- Compare source and downloaded byte counts and SHA-256 digests.
+- Confirm the final `Content-Range` reaches the exact stored EOF after a resumed request.
+- Issue a tiny tail range and confirm it is logged for diagnostics but does not increment completed-download analytics.
+- Issue a substantial resume (at least 8 MiB for a large object) through EOF and confirm it increments analytics once.
+- Confirm the activity record includes method, response status, requested range, response bytes, and stored object size.
+
 ## macOS And Durability
 
 - Restart the screen server and confirm config/users persist.
@@ -155,4 +167,5 @@ Use this checklist against the remote Mac long-term test instance.
 - Fill passive port range with multiple simultaneous downloads.
 - Confirm passive UPnP/NAT-PMP mappings are created on demand and released after data connections close.
 - Leave monitor running overnight and inspect `status=fail` lines.
+- Generate the weekly report and confirm it separates monitor noise, security events, external failures, admin mistakes, and completed large transfers.
 - Run `ADMIN_PASS=... HOST=192.0.2.10 ./scripts/protocol-lab.sh` for the recursive FTP compatibility suite.

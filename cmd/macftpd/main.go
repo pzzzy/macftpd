@@ -2,6 +2,7 @@ package main
 
 import (
 	"context"
+	"errors"
 	"flag"
 	"fmt"
 	"log"
@@ -9,6 +10,7 @@ import (
 	"os/signal"
 	"path/filepath"
 	"syscall"
+	"time"
 
 	"macftpd/internal/activity"
 	"macftpd/internal/auth"
@@ -63,7 +65,17 @@ func main() {
 	if err != nil {
 		log.Fatalf("create ftp server: %v", err)
 	}
-	http := httpapi.New(cfg.HTTP, store, root, cloudflare.New(cfg.Cloudflare), activityLog, linkStore, tracker)
+	cf := cloudflare.New(cfg.Cloudflare)
+	ftp.SetPublicMutationHook(func(path string) {
+		go func() {
+			ctx, cancel := context.WithTimeout(context.Background(), 15*time.Second)
+			defer cancel()
+			if err := cf.PurgeTag(ctx); err != nil && !errors.Is(err, cloudflare.ErrNotConfigured) {
+				log.Printf("cloudflare: purge public cache after FTP mutation %s: %v", path, err)
+			}
+		}()
+	})
+	http := httpapi.New(cfg.HTTP, store, root, cf, activityLog, linkStore, tracker)
 
 	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
 	defer stop()

@@ -12,6 +12,7 @@ import (
 	"html"
 	"io"
 	"log"
+	"math"
 	"mime"
 	"net"
 	"net/http"
@@ -22,6 +23,7 @@ import (
 	"sort"
 	"strconv"
 	"strings"
+	"sync"
 	"time"
 
 	ftpclient "github.com/jlaffaye/ftp"
@@ -44,14 +46,39 @@ type Server struct {
 	server     *http.Server
 	sessionKey []byte
 	limiter    *ratelimit.Limiter
+	shareLimit *ratelimit.Limiter
 	activity   *activity.Store
 	links      *share.Store
 	tracker    *status.Tracker
+	uploadMu   sync.Mutex
+	uploads    map[string]*uploadLock
+}
+
+type uploadLock struct {
+	mu   sync.Mutex
+	refs int
 }
 
 type principal struct {
 	User  auth.User
 	Perms auth.PermissionSet
+}
+
+type activityMonitorSummary struct {
+	Count      int            `json:"count"`
+	OK         int            `json:"ok"`
+	Failed     int            `json:"failed"`
+	Last       activity.Event `json:"last,omitempty"`
+	LastOK     activity.Event `json:"last_ok,omitempty"`
+	LastFailed activity.Event `json:"last_failed,omitempty"`
+}
+
+type activityDashboard struct {
+	Events           []activity.Event       `json:"events"`
+	Security         []activity.Event       `json:"security"`
+	ExternalFailures []activity.Event       `json:"external_failures"`
+	AdminMistakes    []activity.Event       `json:"admin_mistakes"`
+	Monitor          activityMonitorSummary `json:"monitor"`
 }
 
 type userRequest struct {
@@ -81,7 +108,7 @@ func (r userRequest) user() auth.User {
 }
 
 func New(cfg config.HTTPConfig, store *auth.Store, root *storage.Root, cf *cloudflare.Client, activityLog *activity.Store, links *share.Store, tracker *status.Tracker) *Server {
-	return &Server{cfg: cfg, store: store, root: root, cloudflare: cf, sessionKey: []byte(cfg.SessionKey), limiter: ratelimit.New(5, 10*time.Minute, 5*time.Minute), activity: activityLog, links: links, tracker: tracker}
+	return &Server{cfg: cfg, store: store, root: root, cloudflare: cf, sessionKey: []byte(cfg.SessionKey), limiter: ratelimit.New(5, 10*time.Minute, 5*time.Minute), shareLimit: ratelimit.New(5, 10*time.Minute, 5*time.Minute), activity: activityLog, links: links, tracker: tracker, uploads: map[string]*uploadLock{}}
 }
 
 func (s *Server) ListenAndServe(ctx context.Context) error {
@@ -123,12 +150,7 @@ func (s *Server) ListenAndServe(ctx context.Context) error {
 	mux.HandleFunc("/api/retention", s.requireAdmin(s.retentionAPI))
 	mux.HandleFunc("/api/retention/restore", s.requireAdmin(s.restoreAPI))
 	mux.HandleFunc("/api/cloudflare/purge", s.requireAdmin(s.purgeCloudflare))
-	s.server = &http.Server{
-		Addr:         s.cfg.Listen,
-		Handler:      securityHeaders(mux),
-		ReadTimeout:  s.cfg.ReadTimeout.Std(10 * time.Second),
-		WriteTimeout: s.cfg.WriteTimeout.Std(60 * time.Second),
-	}
+	s.server = s.newHTTPServer(securityHeaders(mux))
 	go func() {
 		<-ctx.Done()
 		shutdownCtx, cancel := context.WithTimeout(context.WithoutCancel(ctx), 10*time.Second)
@@ -141,6 +163,17 @@ func (s *Server) ListenAndServe(ctx context.Context) error {
 		return nil
 	}
 	return err
+}
+
+func (s *Server) newHTTPServer(handler http.Handler) *http.Server {
+	return &http.Server{
+		Addr:              s.cfg.Listen,
+		Handler:           handler,
+		ReadHeaderTimeout: s.cfg.ReadHeaderTimeout.Std(10 * time.Second),
+		ReadTimeout:       time.Duration(s.cfg.ReadTimeout),
+		WriteTimeout:      time.Duration(s.cfg.WriteTimeout),
+		IdleTimeout:       s.cfg.IdleTimeout.Std(60 * time.Second),
+	}
 }
 
 func (s *Server) Addr() string {
@@ -174,8 +207,8 @@ func (s *Server) public(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	s.setPublicCacheHeaders(w)
-	s.logActivity(activity.Event{Type: "public_download", Protocol: "http", Actor: "public", Remote: remoteAddr(r), Referrer: r.Referer(), Action: "download", Path: virtual, Bytes: info.Size(), Detail: "public HTTP download"})
-	s.serveStorageFile(w, r, realPath, info.Name())
+	result := s.serveStorageFile(w, r, realPath, info.Name())
+	s.logDownloadActivity(activity.Event{Type: "public_download", Protocol: "http", Actor: "public", Remote: remoteAddr(r), Referrer: r.Referer(), Action: "download", Path: virtual, Bytes: result.Bytes, Detail: "public HTTP download"}, result)
 }
 
 func (s *Server) publicInfo(w http.ResponseWriter, r *http.Request) {
@@ -219,18 +252,24 @@ func (s *Server) shareLink(w http.ResponseWriter, r *http.Request) {
 		http.NotFound(w, r)
 		return
 	}
-	password := ""
-	if r.Method == http.MethodPost {
-		password = r.FormValue("password")
-	} else if meta.HasPassword && s.verifyShareCookie(r, id, token) {
-		password = "__cookie__"
+	cookieAuthorized := meta.HasPassword && s.verifyShareCookie(r, id, token)
+	if meta.HasPassword && r.Method != http.MethodPost && !cookieAuthorized {
+		w.Header().Set("Content-Type", "text/html; charset=utf-8")
+		_ = passwordTemplate.Execute(w, map[string]any{"Title": "Protected share"})
+		return
 	}
-	if meta.HasPassword && password == "__cookie__" {
+	if cookieAuthorized {
 		meta, err = s.links.VerifyAuthorized(id, token)
+	} else if meta.HasPassword {
+		meta, err = s.verifySharePassword(r, id, token, r.FormValue("password"))
 	} else {
-		meta, err = s.links.Verify(id, token, password)
+		meta, err = s.links.Verify(id, token, "")
 	}
 	if err != nil {
+		if errors.Is(err, errSharePasswordLimited) {
+			http.Error(w, err.Error(), http.StatusTooManyRequests)
+			return
+		}
 		if meta.HasPassword || errors.Is(err, share.ErrDenied) {
 			w.Header().Set("Content-Type", "text/html; charset=utf-8")
 			_ = passwordTemplate.Execute(w, map[string]any{"Title": "Protected share"})
@@ -255,10 +294,25 @@ func (s *Server) shareLink(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	if !info.IsDir() {
-		_ = s.links.RecordDownload(id)
-		s.logActivity(activity.Event{Type: "share_download", Protocol: "http", Actor: "share-link", Remote: remoteAddr(r), Referrer: r.Referer(), Action: "download", Path: clean, Bytes: info.Size(), Detail: "public share download"})
+		if r.Method != http.MethodGet && r.Method != http.MethodHead {
+			http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
+			return
+		}
+		reserved := false
+		if r.Method == http.MethodGet {
+			if err := s.links.ReserveDownload(id); err != nil {
+				http.Error(w, "share unavailable", http.StatusGone)
+				return
+			}
+			reserved = true
+		}
+		s.setShareDownloadHeaders(w)
 		setFileDisposition(w, r, info.Name())
-		s.serveStorageFile(w, r, realPath, info.Name())
+		result := s.serveStorageFile(w, r, realPath, info.Name())
+		if reserved {
+			_ = s.links.FinishDownload(id, result.RecordableDownload())
+		}
+		s.logDownloadActivity(activity.Event{Type: "share_download", Protocol: "http", Actor: "share-link", Remote: remoteAddr(r), Referrer: r.Referer(), Action: "download", Path: clean, Bytes: result.Bytes, Detail: "public share download"}, result)
 		return
 	}
 	w.Header().Set("Content-Type", "text/html; charset=utf-8")
@@ -316,7 +370,11 @@ func (s *Server) dropLink(w http.ResponseWriter, r *http.Request) {
 			http.Error(w, "bad password form", http.StatusBadRequest)
 			return
 		}
-		if _, err := s.links.Verify(id, token, r.FormValue("password")); err != nil {
+		if _, err := s.verifySharePassword(r, id, token, r.FormValue("password")); err != nil {
+			if errors.Is(err, errSharePasswordLimited) {
+				http.Error(w, err.Error(), http.StatusTooManyRequests)
+				return
+			}
 			w.Header().Set("Content-Type", "text/html; charset=utf-8")
 			_ = passwordTemplate.Execute(w, map[string]any{"Title": "Protected drop"})
 			return
@@ -325,13 +383,17 @@ func (s *Server) dropLink(w http.ResponseWriter, r *http.Request) {
 		redirectSamePath(w, r)
 		return
 	}
+	if meta.HasPassword && !s.verifyShareCookie(r, id, token) {
+		http.Error(w, "authorize the protected drop before uploading", http.StatusUnauthorized)
+		return
+	}
 	r.Body = http.MaxBytesReader(w, r.Body, 20<<30)
 	// #nosec G120 -- MaxBytesReader caps the request; multipart spools file parts above maxMemory.
 	if err := r.ParseMultipartForm(32 << 20); err != nil {
 		http.Error(w, "bad upload", http.StatusBadRequest)
 		return
 	}
-	if meta.HasPassword && s.verifyShareCookie(r, id, token) {
+	if meta.HasPassword {
 		meta, err = s.links.VerifyAuthorized(id, token)
 	} else {
 		meta, err = s.links.Verify(id, token, r.FormValue("password"))
@@ -366,29 +428,46 @@ func (s *Server) dropLink(w http.ResponseWriter, r *http.Request) {
 		http.Error(w, "bad destination", http.StatusBadRequest)
 		return
 	}
-	if !meta.AllowOverwrite {
-		if _, err := s.root.Stat(dest); err == nil {
-			http.Error(w, "destination exists", http.StatusConflict)
-			return
-		}
-	} else if info, err := s.root.Stat(dest); err == nil && !info.IsDir() {
-		_, _ = s.root.Version(dest, destVirtual, "drop-link")
-	}
 	if err := s.root.MkdirAllParent(dest, 0o750); err != nil {
 		http.Error(w, err.Error(), http.StatusInternalServerError)
 		return
 	}
-	out, err := s.root.OpenFile(dest, os.O_CREATE|os.O_TRUNC|os.O_WRONLY, 0o640)
+	out, stagedPath, err := s.createStagedUpload("drop")
 	if err != nil {
 		http.Error(w, err.Error(), http.StatusInternalServerError)
 		return
 	}
+	defer func() {
+		_ = out.Close()
+		_ = s.root.Remove(stagedPath)
+	}()
 	n, err := io.Copy(out, file)
-	_ = out.Close()
 	if err != nil {
 		http.Error(w, err.Error(), http.StatusInternalServerError)
 		return
 	}
+	if err := out.Close(); err != nil {
+		http.Error(w, err.Error(), http.StatusInternalServerError)
+		return
+	}
+	if meta.AllowOverwrite {
+		err = s.root.ReplaceFile(stagedPath, dest, destVirtual, "drop-link", true)
+	} else {
+		err = s.root.InstallFile(stagedPath, dest)
+	}
+	if err != nil {
+		status := http.StatusInternalServerError
+		if !meta.AllowOverwrite && errors.Is(err, os.ErrExist) {
+			status = http.StatusConflict
+		}
+		http.Error(w, err.Error(), status)
+		return
+	}
+	if err := s.root.Chmod(dest, 0o640); err != nil {
+		http.Error(w, err.Error(), http.StatusInternalServerError)
+		return
+	}
+	s.purgePublicPath(r.Context(), r, destVirtual)
 	s.logActivity(activity.Event{Type: "public_drop", Protocol: "http", Actor: "drop-link", Remote: remoteAddr(r), Action: "upload", Path: destVirtual, Bytes: n, Detail: "public drop link upload"})
 	writeJSON(w, http.StatusOK, dropUploadResponse(s.root, destVirtual, n, true))
 }
@@ -431,12 +510,15 @@ func (s *Server) dropChunk(w http.ResponseWriter, r *http.Request, meta share.Pu
 		writeJSON(w, http.StatusInternalServerError, errorBody(err.Error()))
 		return
 	}
-	partPath := filepath.Join(tmpDir, "drop-"+uploadID+".part")
+	cleanupUploadParts(tmpDir, time.Now().Add(-24*time.Hour))
+	partPath := filepath.Join(tmpDir, uploadPartName("drop:"+meta.ID+":"+destVirtual+":"+strconv.FormatInt(total, 10), uploadID))
 	partPath = filepath.Clean(partPath)
 	if !strings.HasPrefix(partPath, tmpDir+string(os.PathSeparator)) {
 		writeJSON(w, http.StatusBadRequest, errorBody("bad upload id"))
 		return
 	}
+	releaseUpload := s.lockUpload(partPath)
+	defer releaseUpload()
 	if offset == 0 {
 		_ = os.Remove(partPath)
 	}
@@ -459,17 +541,17 @@ func (s *Server) dropChunk(w http.ResponseWriter, r *http.Request, meta share.Pu
 		writeJSON(w, http.StatusInternalServerError, errorBody(err.Error()))
 		return
 	}
-	n, err := io.Copy(part, chunk)
+	n, err := copyChunk(part, chunk, offset, total)
 	if err != nil {
+		if errors.Is(err, errChunkExceedsTotal) {
+			writeJSON(w, http.StatusBadRequest, errorBody(err.Error()))
+			return
+		}
 		s.logActivity(activity.Event{Type: "public_drop", Protocol: "http", Actor: "drop-link", Remote: remoteAddr(r), Action: "upload", Outcome: "failed", Path: destVirtual, Bytes: offset + n, Detail: err.Error()})
 		writeJSON(w, http.StatusInternalServerError, errorBody(err.Error()))
 		return
 	}
 	written := offset + n
-	if written > total {
-		writeJSON(w, http.StatusBadRequest, errorBody("chunk exceeds total size"))
-		return
-	}
 	if written < total {
 		writeJSON(w, http.StatusOK, dropUploadResponse(s.root, destVirtual, written, false))
 		return
@@ -478,26 +560,28 @@ func (s *Server) dropChunk(w http.ResponseWriter, r *http.Request, meta share.Pu
 		writeJSON(w, http.StatusInternalServerError, errorBody(err.Error()))
 		return
 	}
-	if !meta.AllowOverwrite {
-		if _, err := s.root.Stat(dest); err == nil {
-			writeJSON(w, http.StatusConflict, errorBody("destination exists"))
-			return
-		}
-	} else if info, err := s.root.Stat(dest); err == nil && !info.IsDir() {
-		_, _ = s.root.Version(dest, destVirtual, "drop-link")
-	}
 	if err := s.root.MkdirAllParent(dest, 0o750); err != nil {
 		writeJSON(w, http.StatusInternalServerError, errorBody(err.Error()))
 		return
 	}
-	if err := s.root.Rename(partPath, dest); err != nil {
-		writeJSON(w, http.StatusInternalServerError, errorBody(err.Error()))
+	if meta.AllowOverwrite {
+		err = s.root.ReplaceFile(partPath, dest, destVirtual, "drop-link", true)
+	} else {
+		err = s.root.InstallFile(partPath, dest)
+	}
+	if err != nil {
+		status := http.StatusInternalServerError
+		if !meta.AllowOverwrite && errors.Is(err, os.ErrExist) {
+			status = http.StatusConflict
+		}
+		writeJSON(w, status, errorBody(err.Error()))
 		return
 	}
 	if err := s.root.Chmod(dest, 0o640); err != nil {
 		writeJSON(w, http.StatusInternalServerError, errorBody(err.Error()))
 		return
 	}
+	s.purgePublicPath(r.Context(), r, destVirtual)
 	s.logActivity(activity.Event{Type: "public_drop", Protocol: "http", Actor: "drop-link", Remote: remoteAddr(r), Action: "upload", Path: destVirtual, Bytes: written, Detail: "public drop link chunked upload"})
 	writeJSON(w, http.StatusOK, dropUploadResponse(s.root, destVirtual, written, true))
 }
@@ -780,7 +864,7 @@ func (s *Server) adminActivityPartial(w http.ResponseWriter, r *http.Request, _ 
 		limit = 80
 	}
 	w.Header().Set("Content-Type", "text/html; charset=utf-8")
-	_ = activityPartialTemplate.Execute(w, map[string]any{"Events": s.activity.Recent(limit, 0)})
+	_ = activityPartialTemplate.Execute(w, s.activityDashboard(limit, 0))
 }
 
 func (s *Server) adminStatusPartial(w http.ResponseWriter, r *http.Request, _ principal) {
@@ -1043,6 +1127,7 @@ func (s *Server) files(w http.ResponseWriter, r *http.Request, p principal) {
 			writeJSON(w, http.StatusInternalServerError, errorBody(err.Error()))
 			return
 		}
+		s.purgePublicPath(r.Context(), r, clean)
 		s.logActivity(activity.Event{Type: "admin_file", Protocol: "http", Actor: p.User.Username, Remote: remoteAddr(r), Action: "delete", Path: clean, Detail: "admin moved file or folder to trash"})
 		writeJSON(w, http.StatusOK, map[string]bool{"ok": true})
 		return
@@ -1068,7 +1153,11 @@ func (s *Server) files(w http.ResponseWriter, r *http.Request, p principal) {
 			return
 		}
 		if info, err := s.root.Stat(destReal); err == nil && !info.IsDir() {
-			_, _ = s.root.Version(destReal, destClean, p.User.Username)
+			if _, err := s.root.Version(destReal, destClean, p.User.Username); err != nil {
+				s.logActivity(activity.Event{Type: "admin_file", Protocol: "http", Actor: p.User.Username, Remote: remoteAddr(r), Action: "move", Outcome: "failed", Path: clean, DestPath: destClean, Detail: err.Error()})
+				writeJSON(w, http.StatusInternalServerError, errorBody(err.Error()))
+				return
+			}
 		}
 		if err := s.root.Rename(realPath, destReal); err != nil {
 			s.logActivity(activity.Event{Type: "admin_file", Protocol: "http", Actor: p.User.Username, Remote: remoteAddr(r), Action: "move", Outcome: "failed", Path: clean, DestPath: destClean, Detail: err.Error()})
@@ -1080,6 +1169,7 @@ func (s *Server) files(w http.ResponseWriter, r *http.Request, p principal) {
 			writeJSON(w, http.StatusInternalServerError, errorBody(err.Error()))
 			return
 		}
+		s.purgePublicPath(r.Context(), r, clean, destClean)
 		s.logActivity(activity.Event{Type: "admin_file", Protocol: "http", Actor: p.User.Username, Remote: remoteAddr(r), Action: "move", Path: clean, DestPath: destClean, Detail: "admin renamed or moved file"})
 		writeJSON(w, http.StatusOK, map[string]any{"entry": storageEntry(info, destClean)})
 		return
@@ -1089,6 +1179,7 @@ func (s *Server) files(w http.ResponseWriter, r *http.Request, p principal) {
 			writeJSON(w, http.StatusInternalServerError, errorBody(err.Error()))
 			return
 		}
+		s.purgePublicPath(r.Context(), r, clean)
 		s.logActivity(activity.Event{Type: "admin_file", Protocol: "http", Actor: p.User.Username, Remote: remoteAddr(r), Action: "mkdir", Path: clean, Detail: "admin created folder"})
 		writeJSON(w, http.StatusOK, map[string]any{"path": clean})
 		return
@@ -1189,7 +1280,11 @@ func (s *Server) fileAction(w http.ResponseWriter, r *http.Request, p principal)
 			}
 			if req.Overwrite {
 				if info, err := s.root.Stat(targetReal); err == nil && !info.IsDir() {
-					_, _ = s.root.Version(targetReal, targetClean, p.User.Username)
+					if _, err := s.root.Version(targetReal, targetClean, p.User.Username); err != nil {
+						s.logActivity(activity.Event{Type: "admin_file", Protocol: "http", Actor: p.User.Username, Remote: remoteAddr(r), Action: "move", Outcome: "failed", Path: srcClean, DestPath: targetClean, Detail: err.Error()})
+						writeJSON(w, http.StatusInternalServerError, errorBody(err.Error()))
+						return
+					}
 				}
 			}
 			if err := s.root.Rename(srcReal, targetReal); err != nil {
@@ -1197,13 +1292,18 @@ func (s *Server) fileAction(w http.ResponseWriter, r *http.Request, p principal)
 				writeJSON(w, http.StatusInternalServerError, errorBody(err.Error()))
 				return
 			}
+			s.purgePublicPath(r.Context(), r, srcClean, targetClean)
 			items = append(items, resultItem{Path: srcClean, DestPath: targetClean, Operation: "move"})
 			s.logActivity(activity.Event{Type: "admin_file", Protocol: "http", Actor: p.User.Username, Remote: remoteAddr(r), Action: "move", Path: srcClean, DestPath: targetClean, Detail: "admin moved file or folder"})
 			continue
 		}
 		if req.Overwrite {
 			if info, err := s.root.Stat(targetReal); err == nil && !info.IsDir() {
-				_, _ = s.root.Version(targetReal, targetClean, p.User.Username)
+				if _, err := s.root.Version(targetReal, targetClean, p.User.Username); err != nil {
+					s.logActivity(activity.Event{Type: "admin_file", Protocol: "http", Actor: p.User.Username, Remote: remoteAddr(r), Action: "copy", Outcome: "failed", Path: srcClean, DestPath: targetClean, Detail: err.Error()})
+					writeJSON(w, http.StatusInternalServerError, errorBody(err.Error()))
+					return
+				}
 			}
 		}
 		result, err := s.root.Copy(srcReal, targetReal, storage.CopyOptions{Deduplicate: req.Deduplicate, Overwrite: req.Overwrite})
@@ -1212,6 +1312,7 @@ func (s *Server) fileAction(w http.ResponseWriter, r *http.Request, p principal)
 			writeJSON(w, http.StatusInternalServerError, errorBody(err.Error()))
 			return
 		}
+		s.purgePublicPath(r.Context(), r, targetClean)
 		totalFiles += result.Files
 		totalBytes += result.Bytes
 		items = append(items, resultItem{Path: srcClean, DestPath: targetClean, Files: result.Files, Bytes: result.Bytes, Strategy: result.Strategy, Operation: "copy"})
@@ -1258,23 +1359,65 @@ func (s *Server) download(w http.ResponseWriter, r *http.Request, p principal) {
 		return
 	}
 	w.Header().Set("Content-Disposition", fmt.Sprintf("attachment; filename=%q", filepath.Base(realPath)))
-	s.logActivity(activity.Event{Type: "admin_download", Protocol: "http", Actor: p.User.Username, Remote: remoteAddr(r), Action: "download", Path: r.URL.Query().Get("path"), Bytes: info.Size(), Detail: "admin download"})
-	s.serveStorageFile(w, r, realPath, info.Name())
+	result := s.serveStorageFile(w, r, realPath, info.Name())
+	s.logDownloadActivity(activity.Event{Type: "admin_download", Protocol: "http", Actor: p.User.Username, Remote: remoteAddr(r), Action: "download", Path: r.URL.Query().Get("path"), Bytes: result.Bytes, Detail: "admin download"}, result)
 }
 
-func (s *Server) serveStorageFile(w http.ResponseWriter, r *http.Request, realPath, name string) {
+type fileServeResult struct {
+	Status int
+	Bytes  int64
+	Size   int64
+	Method string
+	Err    error
+	Range  string
+}
+
+func (r fileServeResult) Success() bool {
+	return r.Err == nil && r.Status >= 200 && r.Status < 400 && (r.Bytes > 0 || r.Method == http.MethodGet && r.Status == http.StatusOK && r.Size == 0)
+}
+
+func (r fileServeResult) RecordableDownload() bool {
+	if !r.Success() {
+		return false
+	}
+	if r.Status == http.StatusOK {
+		return true
+	}
+	if r.Status != http.StatusPartialContent || !rangeRunsToEOF(r.Range, r.Size) {
+		return false
+	}
+	minimumResume := max(int64(1), r.Size/100)
+	minimumResume = min(minimumResume, int64(8<<20))
+	return r.Bytes >= minimumResume
+}
+
+func (s *Server) serveStorageFile(w http.ResponseWriter, r *http.Request, realPath, name string) fileServeResult {
+	counter := &countingResponseWriter{ResponseWriter: w}
+	result := fileServeResult{Method: r.Method, Range: r.Header.Get("Range")}
 	file, err := s.root.Open(realPath)
 	if err != nil {
-		http.NotFound(w, r)
-		return
+		http.NotFound(counter, r)
+		result.Status = counter.Status()
+		result.Bytes = counter.Bytes
+		result.Err = err
+		return result
 	}
 	defer file.Close()
 	info, err := file.Stat()
 	if err != nil || info.IsDir() {
-		http.NotFound(w, r)
-		return
+		http.NotFound(counter, r)
+		result.Status = counter.Status()
+		result.Bytes = counter.Bytes
+		result.Err = err
+		return result
 	}
-	http.ServeContent(w, r, name, info.ModTime(), file)
+	result.Size = info.Size()
+	counter.Header().Set("Accept-Ranges", "bytes")
+	http.ServeContent(counter, r, name, info.ModTime(), file)
+	result.Status = counter.Status()
+	result.Bytes = counter.Bytes
+	result.Err = counter.Err
+	return result
 }
 
 func (s *Server) upload(w http.ResponseWriter, r *http.Request, p principal) {
@@ -1311,21 +1454,39 @@ func (s *Server) upload(w http.ResponseWriter, r *http.Request, p principal) {
 		writeJSON(w, http.StatusBadRequest, errorBody("bad destination"))
 		return
 	}
-	if info, err := s.root.Stat(dest); err == nil && !info.IsDir() {
-		_, _ = s.root.Version(dest, destVirtual, p.User.Username)
+	if err := s.root.MkdirAllParent(dest, 0o750); err != nil {
+		writeJSON(w, http.StatusInternalServerError, errorBody(err.Error()))
+		return
 	}
-	out, err := s.root.OpenFile(dest, os.O_CREATE|os.O_TRUNC|os.O_WRONLY, 0o640)
+	out, stagedPath, err := s.createStagedUpload("admin")
 	if err != nil {
 		writeJSON(w, http.StatusInternalServerError, errorBody(err.Error()))
 		return
 	}
-	defer out.Close()
+	defer func() {
+		_ = out.Close()
+		_ = s.root.Remove(stagedPath)
+	}()
 	n, err := io.Copy(out, file)
 	if err != nil {
 		s.logActivity(activity.Event{Type: "admin_upload", Protocol: "http", Actor: p.User.Username, Remote: remoteAddr(r), Action: "upload", Outcome: "failed", Path: destVirtual, Bytes: n, Detail: err.Error()})
 		writeJSON(w, http.StatusInternalServerError, errorBody(err.Error()))
 		return
 	}
+	if err := out.Close(); err != nil {
+		writeJSON(w, http.StatusInternalServerError, errorBody(err.Error()))
+		return
+	}
+	if err := s.root.ReplaceFile(stagedPath, dest, destVirtual, p.User.Username, true); err != nil {
+		s.logActivity(activity.Event{Type: "admin_upload", Protocol: "http", Actor: p.User.Username, Remote: remoteAddr(r), Action: "upload", Outcome: "failed", Path: destVirtual, Bytes: n, Detail: err.Error()})
+		writeJSON(w, http.StatusInternalServerError, errorBody(err.Error()))
+		return
+	}
+	if err := s.root.Chmod(dest, 0o640); err != nil {
+		writeJSON(w, http.StatusInternalServerError, errorBody(err.Error()))
+		return
+	}
+	s.purgePublicPath(r.Context(), r, destVirtual)
 	s.logActivity(activity.Event{Type: "admin_upload", Protocol: "http", Actor: p.User.Username, Remote: remoteAddr(r), Action: "upload", Path: destVirtual, Bytes: n, Detail: "admin upload"})
 	writeJSON(w, http.StatusOK, map[string]any{"path": filepath.ToSlash(filepath.Join(dir, filename))})
 }
@@ -1385,12 +1546,15 @@ func (s *Server) uploadChunk(w http.ResponseWriter, r *http.Request, p principal
 		writeJSON(w, http.StatusInternalServerError, errorBody(err.Error()))
 		return
 	}
-	partPath := filepath.Join(tmpDir, uploadID+".part")
+	cleanupUploadParts(tmpDir, time.Now().Add(-24*time.Hour))
+	partPath := filepath.Join(tmpDir, uploadPartName("admin:"+p.User.Username+":"+destVirtual+":"+strconv.FormatInt(total, 10), uploadID))
 	partPath = filepath.Clean(partPath)
 	if !strings.HasPrefix(partPath, tmpDir+string(os.PathSeparator)) {
 		writeJSON(w, http.StatusBadRequest, errorBody("bad upload id"))
 		return
 	}
+	releaseUpload := s.lockUpload(partPath)
+	defer releaseUpload()
 	if offset == 0 {
 		_ = os.Remove(partPath)
 	}
@@ -1413,17 +1577,17 @@ func (s *Server) uploadChunk(w http.ResponseWriter, r *http.Request, p principal
 		writeJSON(w, http.StatusInternalServerError, errorBody(err.Error()))
 		return
 	}
-	n, err := io.Copy(part, chunk)
+	n, err := copyChunk(part, chunk, offset, total)
 	if err != nil {
+		if errors.Is(err, errChunkExceedsTotal) {
+			writeJSON(w, http.StatusBadRequest, errorBody(err.Error()))
+			return
+		}
 		s.logActivity(activity.Event{Type: "admin_upload", Protocol: "http", Actor: p.User.Username, Remote: remoteAddr(r), Action: "upload", Outcome: "failed", Path: destVirtual, Bytes: offset + n, Detail: err.Error()})
 		writeJSON(w, http.StatusInternalServerError, errorBody(err.Error()))
 		return
 	}
 	written := offset + n
-	if written > total {
-		writeJSON(w, http.StatusBadRequest, errorBody("chunk exceeds total size"))
-		return
-	}
 	if written < total {
 		writeJSON(w, http.StatusOK, map[string]any{"path": destVirtual, "received": written, "complete": false})
 		return
@@ -1432,14 +1596,11 @@ func (s *Server) uploadChunk(w http.ResponseWriter, r *http.Request, p principal
 		writeJSON(w, http.StatusInternalServerError, errorBody(err.Error()))
 		return
 	}
-	if info, err := s.root.Stat(dest); err == nil && !info.IsDir() {
-		_, _ = s.root.Version(dest, destVirtual, p.User.Username)
-	}
 	if err := s.root.MkdirAllParent(dest, 0o750); err != nil {
 		writeJSON(w, http.StatusInternalServerError, errorBody(err.Error()))
 		return
 	}
-	if err := s.root.Rename(partPath, dest); err != nil {
+	if err := s.root.ReplaceFile(partPath, dest, destVirtual, p.User.Username, true); err != nil {
 		writeJSON(w, http.StatusInternalServerError, errorBody(err.Error()))
 		return
 	}
@@ -1447,6 +1608,7 @@ func (s *Server) uploadChunk(w http.ResponseWriter, r *http.Request, p principal
 		writeJSON(w, http.StatusInternalServerError, errorBody(err.Error()))
 		return
 	}
+	s.purgePublicPath(r.Context(), r, destVirtual)
 	s.logActivity(activity.Event{Type: "admin_upload", Protocol: "http", Actor: p.User.Username, Remote: remoteAddr(r), Action: "upload", Path: destVirtual, Bytes: written, Detail: "admin chunked upload"})
 	writeJSON(w, http.StatusOK, map[string]any{"path": destVirtual, "received": written, "complete": true})
 }
@@ -1462,6 +1624,89 @@ func safeUploadID(id string) bool {
 		return false
 	}
 	return true
+}
+
+var errChunkExceedsTotal = errors.New("chunk exceeds total size")
+
+func uploadPartName(scope, uploadID string) string {
+	sum := sha256.Sum256([]byte(scope + "\x00" + uploadID))
+	return base64.RawURLEncoding.EncodeToString(sum[:]) + ".part"
+}
+
+func copyChunk(part *os.File, chunk io.Reader, offset, total int64) (int64, error) {
+	remaining := total - offset
+	limit := remaining
+	if remaining < math.MaxInt64 {
+		limit++
+	}
+	n, err := io.Copy(part, io.LimitReader(chunk, limit))
+	if err != nil {
+		return n, err
+	}
+	if n <= remaining {
+		return n, nil
+	}
+	if err := part.Truncate(offset); err != nil {
+		return n, errors.Join(errChunkExceedsTotal, err)
+	}
+	return n, errChunkExceedsTotal
+}
+
+func cleanupUploadParts(dir string, before time.Time) {
+	entries, err := os.ReadDir(dir)
+	if err != nil {
+		return
+	}
+	for _, entry := range entries {
+		if entry.IsDir() || !strings.HasSuffix(entry.Name(), ".part") {
+			continue
+		}
+		info, err := entry.Info()
+		if err == nil && info.ModTime().Before(before) {
+			_ = os.Remove(filepath.Join(dir, entry.Name()))
+		}
+	}
+}
+
+func (s *Server) createStagedUpload(prefix string) (*os.File, string, error) {
+	dir := filepath.Join(s.root.Base, "._macftpd_uploads")
+	if err := s.root.MkdirAll(dir, 0o700); err != nil {
+		return nil, "", err
+	}
+	for attempt := 0; attempt < 10; attempt++ {
+		name := fmt.Sprintf("%s-%d-%d.part", prefix, time.Now().UnixNano(), attempt)
+		stagedPath := filepath.Join(dir, name)
+		file, err := s.root.OpenFile(stagedPath, os.O_CREATE|os.O_EXCL|os.O_RDWR, 0o600)
+		if err == nil {
+			return file, stagedPath, nil
+		}
+		if !errors.Is(err, os.ErrExist) {
+			return nil, "", err
+		}
+	}
+	return nil, "", errors.New("cannot allocate staged upload")
+}
+
+func (s *Server) lockUpload(key string) func() {
+	s.uploadMu.Lock()
+	lock := s.uploads[key]
+	if lock == nil {
+		lock = &uploadLock{}
+		s.uploads[key] = lock
+	}
+	lock.refs++
+	s.uploadMu.Unlock()
+
+	lock.mu.Lock()
+	return func() {
+		lock.mu.Unlock()
+		s.uploadMu.Lock()
+		lock.refs--
+		if lock.refs == 0 {
+			delete(s.uploads, key)
+		}
+		s.uploadMu.Unlock()
+	}
 }
 
 func (s *Server) fxp(w http.ResponseWriter, r *http.Request, p principal) {
@@ -1484,7 +1729,7 @@ func (s *Server) fxp(w http.ResponseWriter, r *http.Request, p principal) {
 		writeJSON(w, http.StatusBadRequest, errorBody("host, remote_path, and dest_path are required"))
 		return
 	}
-	realDest, _, err := s.root.ResolveAdmin(req.DestPath)
+	realDest, destVirtual, err := s.root.ResolveAdmin(req.DestPath)
 	if err != nil {
 		writeJSON(w, http.StatusBadRequest, errorBody("bad destination"))
 		return
@@ -1509,18 +1754,35 @@ func (s *Server) fxp(w http.ResponseWriter, r *http.Request, p principal) {
 		return
 	}
 	defer rc.Close()
-	out, err := s.root.OpenFile(realDest, os.O_CREATE|os.O_TRUNC|os.O_WRONLY, 0o640)
+	out, stagedPath, err := s.createStagedUpload("fxp")
 	if err != nil {
 		writeJSON(w, http.StatusInternalServerError, errorBody(err.Error()))
 		return
 	}
-	defer out.Close()
+	defer func() {
+		_ = out.Close()
+		_ = s.root.Remove(stagedPath)
+	}()
 	n, err := io.Copy(out, rc)
 	if err != nil {
 		s.logActivity(activity.Event{Type: "admin_fxp", Protocol: "http", Actor: p.User.Username, Remote: remoteAddr(r), Action: "pull", Outcome: "failed", Path: req.RemotePath, DestPath: req.DestPath, Detail: err.Error()})
 		writeJSON(w, http.StatusBadGateway, errorBody(err.Error()))
 		return
 	}
+	if err := out.Close(); err != nil {
+		writeJSON(w, http.StatusInternalServerError, errorBody(err.Error()))
+		return
+	}
+	if err := s.root.ReplaceFile(stagedPath, realDest, destVirtual, p.User.Username, true); err != nil {
+		s.logActivity(activity.Event{Type: "admin_fxp", Protocol: "http", Actor: p.User.Username, Remote: remoteAddr(r), Action: "pull", Outcome: "failed", Path: req.RemotePath, DestPath: destVirtual, Bytes: n, Detail: err.Error()})
+		writeJSON(w, http.StatusInternalServerError, errorBody(err.Error()))
+		return
+	}
+	if err := s.root.Chmod(realDest, 0o640); err != nil {
+		writeJSON(w, http.StatusInternalServerError, errorBody(err.Error()))
+		return
+	}
+	s.purgePublicPath(r.Context(), r, destVirtual)
 	s.logActivity(activity.Event{Type: "admin_fxp", Protocol: "http", Actor: p.User.Username, Remote: remoteAddr(r), Action: "pull", Path: req.RemotePath, DestPath: req.DestPath, Bytes: n, Detail: "admin FTP pull"})
 	writeJSON(w, http.StatusOK, map[string]any{"bytes": n, "dest_path": req.DestPath})
 }
@@ -1539,7 +1801,7 @@ func (s *Server) purgeCloudflare(w http.ResponseWriter, r *http.Request, _ princ
 	if len(req.Files) > 0 || len(req.Paths) > 0 {
 		files := append([]string{}, req.Files...)
 		for _, p := range req.Paths {
-			files = append(files, absoluteURL(r, publicURLForVirtual(s.root, p)))
+			files = append(files, s.publicAbsoluteURL(r, publicURLForVirtual(s.root, p)))
 		}
 		err = s.cloudflare.PurgeFiles(r.Context(), files)
 	} else {
@@ -1556,11 +1818,49 @@ func (s *Server) purgeCloudflare(w http.ResponseWriter, r *http.Request, _ princ
 	writeJSON(w, http.StatusOK, map[string]bool{"ok": true})
 }
 
-func (s *Server) purgePublicPath(ctx context.Context, r *http.Request, virtual string) {
-	if !strings.HasPrefix(path.Clean(virtual), "/"+s.root.PublicDir) {
+func (s *Server) purgePublicPath(ctx context.Context, r *http.Request, virtuals ...string) {
+	files := make([]string, 0, len(virtuals)*2)
+	for _, virtual := range virtuals {
+		clean := path.Clean(virtual)
+		publicRoot := "/" + s.root.PublicDir
+		if clean != publicRoot && !strings.HasPrefix(clean, publicRoot+"/") {
+			continue
+		}
+		publicPath := publicURLForVirtual(s.root, clean)
+		files = append(files, s.publicAbsoluteURL(r, publicPath))
+		parent := path.Dir(strings.TrimSuffix(publicPath, "/")) + "/"
+		files = append(files, s.publicAbsoluteURL(r, parent))
+	}
+	if len(files) == 0 {
 		return
 	}
-	_ = s.cloudflare.PurgeFiles(ctx, []string{absoluteURL(r, publicURLForVirtual(s.root, virtual))})
+	if err := s.cloudflare.PurgeTag(ctx); err == nil {
+		return
+	}
+	if err := s.cloudflare.PurgeFiles(ctx, uniqueStrings(files)); err != nil && !errors.Is(err, cloudflare.ErrNotConfigured) {
+		log.Printf("cloudflare: purge public paths: %v", err)
+	}
+}
+
+func (s *Server) publicAbsoluteURL(r *http.Request, publicPath string) string {
+	base := strings.TrimRight(strings.TrimSpace(s.cfg.PublicBaseURL), "/")
+	if base == "" {
+		return absoluteURL(r, publicPath)
+	}
+	return base + "/" + strings.TrimLeft(publicPath, "/")
+}
+
+func uniqueStrings(values []string) []string {
+	seen := make(map[string]struct{}, len(values))
+	out := make([]string, 0, len(values))
+	for _, value := range values {
+		if _, ok := seen[value]; ok {
+			continue
+		}
+		seen[value] = struct{}{}
+		out = append(out, value)
+	}
+	return out
 }
 
 func (s *Server) activityFeed(w http.ResponseWriter, r *http.Request, _ principal) {
@@ -1570,8 +1870,127 @@ func (s *Server) activityFeed(w http.ResponseWriter, r *http.Request, _ principa
 	}
 	limit, _ := strconv.Atoi(r.URL.Query().Get("limit"))
 	after, _ := strconv.ParseInt(r.URL.Query().Get("after"), 10, 64)
-	events := s.activity.Recent(limit, after)
-	writeJSON(w, http.StatusOK, map[string]any{"events": events})
+	writeJSON(w, http.StatusOK, s.activityDashboard(limit, after))
+}
+
+func (s *Server) activityDashboard(limit int, after int64) activityDashboard {
+	if limit <= 0 || limit > 200 {
+		limit = 80
+	}
+	scanLimit := limit * 6
+	if scanLimit < 200 {
+		scanLimit = 200
+	}
+	if scanLimit > 500 {
+		scanLimit = 500
+	}
+	dashboard := activityDashboard{
+		Events:           []activity.Event{},
+		Security:         []activity.Event{},
+		ExternalFailures: []activity.Event{},
+		AdminMistakes:    []activity.Event{},
+	}
+	for _, event := range s.activity.Recent(scanLimit, after) {
+		if isMonitorActivity(event) {
+			dashboard.Monitor.Count++
+			if dashboard.Monitor.Last.ID == 0 {
+				dashboard.Monitor.Last = event
+			}
+			if isSecurityActivity(event) {
+				dashboard.Monitor.Failed++
+				if dashboard.Monitor.LastFailed.ID == 0 {
+					dashboard.Monitor.LastFailed = event
+				}
+			} else {
+				dashboard.Monitor.OK++
+				if dashboard.Monitor.LastOK.ID == 0 {
+					dashboard.Monitor.LastOK = event
+				}
+			}
+			continue
+		}
+		if isMaintenanceProbeActivity(event) {
+			continue
+		}
+		if isSecurityActivity(event) {
+			if len(dashboard.Security) < 12 {
+				dashboard.Security = append(dashboard.Security, event)
+			}
+			if isLocalOrKnownAdminActivity(event) {
+				if len(dashboard.AdminMistakes) < 8 {
+					dashboard.AdminMistakes = append(dashboard.AdminMistakes, event)
+				}
+			} else if len(dashboard.ExternalFailures) < 8 {
+				dashboard.ExternalFailures = append(dashboard.ExternalFailures, event)
+			}
+		}
+		if len(dashboard.Events) < limit {
+			dashboard.Events = append(dashboard.Events, event)
+		}
+	}
+	return dashboard
+}
+
+func isMonitorActivity(event activity.Event) bool {
+	pathValue := strings.TrimPrefix(event.Path, "/")
+	destValue := strings.TrimPrefix(event.DestPath, "/")
+	if pathValue == "_monitor" || strings.HasPrefix(pathValue, "_monitor/") {
+		return true
+	}
+	if destValue == "_monitor" || strings.HasPrefix(destValue, "_monitor/") {
+		return true
+	}
+	if event.Type == "ftp_login" &&
+		event.Protocol == "ftp" &&
+		event.Action == "login" &&
+		event.Actor == "admin" &&
+		pathValue == "" &&
+		isLoopbackRemote(event.Remote) {
+		return true
+	}
+	detail := strings.ToLower(event.Detail + " " + event.Message)
+	return strings.Contains(detail, "monitor")
+}
+
+func isMaintenanceProbeActivity(event activity.Event) bool {
+	return event.Type == "http_login" &&
+		event.Protocol == "http" &&
+		event.Action == "login" &&
+		event.Outcome == "failed" &&
+		event.Path == "/api/activity" &&
+		isLoopbackRemote(event.Remote)
+}
+
+func isSecurityActivity(event activity.Event) bool {
+	switch strings.ToLower(event.Outcome) {
+	case "failed", "denied", "limited":
+		return true
+	}
+	return event.Type == "http_security"
+}
+
+func isLocalOrKnownAdminActivity(event activity.Event) bool {
+	if isLoopbackRemote(event.Remote) {
+		return true
+	}
+	actor := strings.ToLower(strings.TrimSpace(event.Actor))
+	if actor == "" || actor == "anonymous" || actor == "someone" {
+		return false
+	}
+	if strings.HasPrefix(event.Type, "admin_") || event.Type == "http_login" || event.Type == "http_logout" {
+		return true
+	}
+	return actor == "admin"
+}
+
+func isLoopbackRemote(remote string) bool {
+	host := remote
+	if h, _, err := net.SplitHostPort(remote); err == nil {
+		host = h
+	}
+	host = strings.Trim(host, "[]")
+	ip := net.ParseIP(host)
+	return ip != nil && ip.IsLoopback()
 }
 
 func (s *Server) statusAPI(w http.ResponseWriter, r *http.Request, _ principal) {
@@ -1755,6 +2174,7 @@ func (s *Server) restoreAPI(w http.ResponseWriter, r *http.Request, p principal)
 		writeJSON(w, http.StatusBadRequest, errorBody(err.Error()))
 		return
 	}
+	s.purgePublicPath(r.Context(), r, dest)
 	s.logActivity(activity.Event{Type: "admin_retention", Protocol: "http", Actor: p.User.Username, Remote: remoteAddr(r), Action: "restore", Path: dest, Detail: "restored retained file"})
 	writeJSON(w, http.StatusOK, map[string]any{"path": dest})
 }
@@ -2081,11 +2501,36 @@ func requestHosts(r *http.Request) []string {
 }
 
 func loginLimitKey(r *http.Request, username string) string {
+	return clientAddrForLimit(r) + "|" + auth.NormalizeName(username)
+}
+
+func clientAddrForLimit(r *http.Request) string {
 	host, _, err := net.SplitHostPort(r.RemoteAddr)
 	if err != nil || host == "" {
 		host = r.RemoteAddr
 	}
-	return host + "|" + auth.NormalizeName(username)
+	if isLoopbackRemote(host) {
+		if forwarded := remoteAddr(r); forwarded != "" {
+			return forwarded
+		}
+	}
+	return host
+}
+
+var errSharePasswordLimited = errors.New("too many failed share password attempts; try again later")
+
+func (s *Server) verifySharePassword(r *http.Request, id, token, password string) (share.PublicLink, error) {
+	key := clientAddrForLimit(r) + "|share|" + id
+	if !s.shareLimit.Allow(key) {
+		return share.PublicLink{}, errSharePasswordLimited
+	}
+	link, err := s.links.Verify(id, token, password)
+	if errors.Is(err, share.ErrDenied) {
+		s.shareLimit.Fail(key)
+	} else if err == nil {
+		s.shareLimit.Reset(key)
+	}
+	return link, err
 }
 
 func remoteAddr(r *http.Request) string {
@@ -2102,6 +2547,106 @@ func remoteAddr(r *http.Request) string {
 	return host
 }
 
+type countingResponseWriter struct {
+	http.ResponseWriter
+	StatusCode int
+	Bytes      int64
+	Err        error
+}
+
+func (w *countingResponseWriter) WriteHeader(status int) {
+	if w.StatusCode != 0 {
+		return
+	}
+	w.StatusCode = status
+	w.ResponseWriter.WriteHeader(status)
+}
+
+func (w *countingResponseWriter) Write(p []byte) (int, error) {
+	if w.StatusCode == 0 {
+		w.StatusCode = http.StatusOK
+	}
+	n, err := w.ResponseWriter.Write(p)
+	w.Bytes += int64(n)
+	if err != nil && w.Err == nil {
+		w.Err = err
+	}
+	return n, err
+}
+
+func (w *countingResponseWriter) Status() int {
+	if w.StatusCode == 0 {
+		return http.StatusOK
+	}
+	return w.StatusCode
+}
+
+func (w *countingResponseWriter) Flush() {
+	if flusher, ok := w.ResponseWriter.(http.Flusher); ok {
+		flusher.Flush()
+	}
+}
+
+func (w *countingResponseWriter) Unwrap() http.ResponseWriter {
+	return w.ResponseWriter
+}
+
+func (s *Server) logDownloadActivity(event activity.Event, result fileServeResult) {
+	event.Bytes = result.Bytes
+	if result.Err != nil || result.Status >= 400 {
+		event.Outcome = "failed"
+		detail := fmt.Sprintf("%s failed status=%d bytes=%d", event.Detail, result.Status, result.Bytes)
+		if result.Range != "" {
+			detail += " range=" + result.Range
+		}
+		if result.Err != nil {
+			detail += " error=" + result.Err.Error()
+		}
+		event.Detail = detail
+	} else {
+		if !result.RecordableDownload() {
+			event.Action = "download_probe"
+		}
+		detail := fmt.Sprintf("%s status=%d bytes=%d", event.Detail, result.Status, result.Bytes)
+		if result.Range != "" {
+			detail += " range=" + result.Range
+		}
+		event.Detail = detail
+	}
+	s.logActivity(event)
+}
+
+func rangeRunsToEOF(header string, size int64) bool {
+	if size <= 0 {
+		return false
+	}
+	value := strings.TrimSpace(header)
+	if len(value) < len("bytes=") || !strings.EqualFold(value[:len("bytes=")], "bytes=") {
+		return false
+	}
+	spec := strings.TrimSpace(value[len("bytes="):])
+	if spec == "" || strings.Contains(spec, ",") {
+		return false
+	}
+	parts := strings.SplitN(spec, "-", 2)
+	if len(parts) != 2 {
+		return false
+	}
+	if strings.TrimSpace(parts[0]) == "" {
+		return false
+	}
+	if _, err := strconv.ParseInt(strings.TrimSpace(parts[0]), 10, 64); err != nil {
+		return false
+	}
+	end := strings.TrimSpace(parts[1])
+	if end == "" {
+		return true
+	}
+	last, err := strconv.ParseInt(end, 10, 64)
+	lastByte := size - 1
+	return err == nil && last >= lastByte
+}
+
 func setFileDisposition(w http.ResponseWriter, r *http.Request, name string) {
 	ctype := mime.TypeByExtension(strings.ToLower(filepath.Ext(name)))
 	inline := strings.HasPrefix(ctype, "image/") || strings.HasPrefix(ctype, "video/") || strings.HasPrefix(ctype, "audio/") || ctype == "application/pdf" || strings.HasPrefix(ctype, "text/")
@@ -2113,6 +2658,13 @@ func setFileDisposition(w http.ResponseWriter, r *http.Request, name string) {
 		disposition = "inline"
 	}
 	w.Header().Set("Content-Disposition", dispositionHeader(disposition, name))
+}
+
+func (s *Server) setShareDownloadHeaders(w http.ResponseWriter) {
+	w.Header().Set("Cache-Control", "private, no-store, no-transform, max-age=0")
+	w.Header().Set("CDN-Cache-Control", "no-store")
+	w.Header().Set("Cloudflare-CDN-Cache-Control", "no-store")
+	w.Header().Set("Accept-Ranges", "bytes")
 }
 
 func dispositionHeader(disposition, name string) string {

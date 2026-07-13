@@ -98,8 +98,8 @@ func templateFuncs() template.FuncMap {
 		"notZero": func(t time.Time) bool {
 			return !t.IsZero()
 		},
-		"adminFilesURL": func(p, selected string) template.URL {
-			return template.URL(filesURL("/admin/", p, selected))
+		"adminFilesURL": func(p, selected string) string {
+			return filesURL("/admin/", p, selected)
 		},
 		"partialFilesURL": func(p, selected string) string {
 			return filesURL("/admin/partials/files", p, selected)
