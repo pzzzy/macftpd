@@ -3,6 +3,7 @@ package httpapi
 import (
 	"bytes"
 	"encoding/json"
+	"errors"
 	"html/template"
 	"mime/multipart"
 	"net/http"
@@ -11,6 +12,7 @@ import (
 	"os"
 	"strconv"
 	"strings"
+	"syscall"
 	"testing"
 	"time"
 
@@ -51,6 +53,35 @@ func TestTinyTailProbeDoesNotCountAsCompletedLargeDownload(t *testing.T) {
 	completedResume := fileServeResult{Status: http.StatusPartialContent, Bytes: 168_078_615, Size: size, Method: http.MethodGet, Range: "bytes=10656005173-"}
 	if !completedResume.RecordableDownload() {
 		t.Fatal("substantial resume through EOF was not counted as a completed download")
+	}
+}
+
+func TestClientDisconnectsAreCanceledRatherThanFailed(t *testing.T) {
+	for _, tc := range []struct {
+		name string
+		err  error
+		want bool
+	}{
+		{name: "broken pipe", err: syscall.EPIPE, want: true},
+		{name: "reset", err: syscall.ECONNRESET, want: true},
+		{name: "HTTP/2 cancel", err: errors.New("stream error: stream ID 7; CANCEL"), want: true},
+		{name: "storage failure", err: errors.New("storage read failed"), want: false},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			if got := isClientDisconnect(tc.err); got != tc.want {
+				t.Fatalf("isClientDisconnect(%v) = %v, want %v", tc.err, got, tc.want)
+			}
+		})
+	}
+
+	srv := testServer(t)
+	srv.logDownloadActivity(activity.Event{
+		Type: "share_download", Protocol: "http", Actor: "share-link",
+		Action: "download", Path: "/public/movie.mkv", Detail: "public share download",
+	}, fileServeResult{Status: http.StatusOK, Bytes: 4 << 20, Method: http.MethodGet, Err: syscall.EPIPE})
+	events := srv.activity.Recent(10, 0)
+	if len(events) != 1 || events[0].Outcome != "canceled" || !strings.Contains(events[0].Message, "canceled") || isSecurityActivity(events[0]) {
+		t.Fatalf("client disconnect was not recorded as a non-failure cancellation: %#v", events)
 	}
 }
 

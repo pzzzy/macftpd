@@ -24,6 +24,7 @@ import (
 	"strconv"
 	"strings"
 	"sync"
+	"syscall"
 	"time"
 
 	ftpclient "github.com/jlaffaye/ftp"
@@ -2593,7 +2594,15 @@ func (w *countingResponseWriter) Unwrap() http.ResponseWriter {
 
 func (s *Server) logDownloadActivity(event activity.Event, result fileServeResult) {
 	event.Bytes = result.Bytes
-	if result.Err != nil || result.Status >= 400 {
+	if result.Err != nil && isClientDisconnect(result.Err) {
+		event.Outcome = "canceled"
+		detail := fmt.Sprintf("%s canceled status=%d bytes=%d", event.Detail, result.Status, result.Bytes)
+		if result.Range != "" {
+			detail += " range=" + result.Range
+		}
+		detail += " error=" + result.Err.Error()
+		event.Detail = detail
+	} else if result.Err != nil || result.Status >= 400 {
 		event.Outcome = "failed"
 		detail := fmt.Sprintf("%s failed status=%d bytes=%d", event.Detail, result.Status, result.Bytes)
 		if result.Range != "" {
@@ -2614,6 +2623,31 @@ func (s *Server) logDownloadActivity(event activity.Event, result fileServeResul
 		event.Detail = detail
 	}
 	s.logActivity(event)
+}
+
+func isClientDisconnect(err error) bool {
+	if err == nil {
+		return false
+	}
+	if errors.Is(err, context.Canceled) || errors.Is(err, net.ErrClosed) ||
+		errors.Is(err, io.ErrClosedPipe) || errors.Is(err, syscall.EPIPE) ||
+		errors.Is(err, syscall.ECONNRESET) {
+		return true
+	}
+	message := strings.ToLower(err.Error())
+	for _, signal := range []string{
+		"broken pipe",
+		"connection reset by peer",
+		"client disconnected",
+		"stream canceled",
+		"stream cancelled",
+		"; cancel",
+	} {
+		if strings.Contains(message, signal) {
+			return true
+		}
+	}
+	return false
 }
 
 func rangeRunsToEOF(header string, size int64) bool {

@@ -225,6 +225,11 @@ func (e Event) humanMessage() string {
 			return fmt.Sprintf("%s %s failed for %s", actor, action, subject)
 		}
 		return fmt.Sprintf("%s %s failed", actor, action)
+	case "canceled", "cancelled":
+		if subject != "" {
+			return fmt.Sprintf("%s %s canceled for %s", actor, action, subject)
+		}
+		return fmt.Sprintf("%s %s canceled", actor, action)
 	}
 	if e.DestPath != "" && subject != "" {
 		return fmt.Sprintf("%s %s %s to %s", actor, action, subject, e.DestPath)

@@ -1,6 +1,7 @@
 package ftpserver
 
 import (
+	"bufio"
 	"bytes"
 	"context"
 	"crypto/ecdsa"
@@ -49,6 +50,64 @@ func TestPassiveDataPeerMustMatchControlPeer(t *testing.T) {
 		t.Fatal("FXP-enabled passive data peer was denied")
 	}
 }
+
+func TestFTPMonitorMarkerRequiresLoopback(t *testing.T) {
+	loopback := &net.TCPAddr{IP: net.ParseIP("127.0.0.1"), Port: 50000}
+	external := &net.TCPAddr{IP: net.ParseIP("203.0.113.10"), Port: 50000}
+	if !monitorClientAllowed(loopback, "macftpd-monitor") {
+		t.Fatal("loopback monitor marker was denied")
+	}
+	if monitorClientAllowed(external, "macftpd-monitor") {
+		t.Fatal("external client was allowed to suppress monitor activity")
+	}
+	if monitorClientAllowed(loopback, "ordinary-client") {
+		t.Fatal("ordinary client was treated as the monitor")
+	}
+
+	left, right := net.Pipe()
+	defer left.Close()
+	defer right.Close()
+	conn := &testRemoteConn{Conn: left, remote: loopback}
+	ss := &session{server: &Server{}, conn: conn, writer: bufio.NewWriter(io.Discard)}
+	ss.dispatch("CLNT", "macftpd-monitor")
+	if !ss.monitor {
+		t.Fatal("CLNT did not mark the loopback monitor session")
+	}
+}
+
+func TestFTPMonitorSuccessesAreCoalescedAfterCompletedCycle(t *testing.T) {
+	activityLog := activity.New(100)
+	server := &Server{activity: activityLog}
+	left, right := net.Pipe()
+	defer left.Close()
+	defer right.Close()
+	ss := &session{server: server, conn: left, username: "admin", monitor: true}
+
+	for _, action := range []string{"login", "mkdir", "upload", "download"} {
+		ss.logActivity(action, "ok", "/_monitor/probe.txt", "", 10, "probe step")
+	}
+	if events := activityLog.Recent(10, 0); len(events) != 0 {
+		t.Fatalf("intermediate monitor successes were logged: %#v", events)
+	}
+	ss.logActivity("delete", "ok", "/_monitor/probe.txt", "", 0, "cleanup")
+	ss.logActivity("delete", "ok", "/_monitor/probe-2.txt", "", 0, "cleanup")
+	events := activityLog.Recent(10, 0)
+	if len(events) != 1 || events[0].Outcome != "ok" || events[0].Detail != "FTP monitor cycle completed" {
+		t.Fatalf("completed monitor cycle was not coalesced: %#v", events)
+	}
+	ss.logActivity("download", "failed", "/_monitor/probe.txt", "", 3, "connection reset")
+	events = activityLog.Recent(10, 0)
+	if len(events) != 2 || events[0].Outcome != "failed" {
+		t.Fatalf("monitor failure was suppressed: %#v", events)
+	}
+}
+
+type testRemoteConn struct {
+	net.Conn
+	remote net.Addr
+}
+
+func (c *testRemoteConn) RemoteAddr() net.Addr { return c.remote }
 
 func TestFTPActiveSessionRevalidatesDisabledUser(t *testing.T) {
 	dir := t.TempDir()

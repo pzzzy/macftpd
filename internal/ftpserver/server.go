@@ -49,6 +49,8 @@ type Server struct {
 	publicHook  func(string)
 	readNoiseMu sync.Mutex
 	readNoise   map[string]readNoiseEvent
+	monitorMu   sync.Mutex
+	monitorLast time.Time
 }
 
 type readNoiseEvent struct {
@@ -58,6 +60,11 @@ type readNoiseEvent struct {
 }
 
 const readNoiseReportInterval = 10 * time.Minute
+
+const (
+	monitorClientName      = "macftpd-monitor"
+	monitorSuccessInterval = time.Hour
+)
 
 type session struct {
 	server        *Server
@@ -78,6 +85,7 @@ type session struct {
 	restartSet    bool
 	secure        bool
 	protPrivate   bool
+	monitor       bool
 	statusID      int64
 }
 
@@ -336,11 +344,16 @@ func (s *session) dispatch(cmd, arg string) bool {
 	case "SYST":
 		s.reply(215, "UNIX Type: L8")
 	case "FEAT":
-		features := []string{"UTF8", "EPSV", "PASV", "REST STREAM", "SIZE", "MDTM", "MLST type*;size*;modify*;perm*;", "MLSD"}
+		features := []string{"UTF8", "CLNT", "EPSV", "PASV", "REST STREAM", "SIZE", "MDTM", "MLST type*;size*;modify*;perm*;", "MLSD"}
 		if s.server.tlsConfig != nil {
 			features = append(features, "AUTH TLS", "PBSZ", "PROT")
 		}
 		s.multiline(211, features, "End")
+	case "CLNT":
+		if monitorClientAllowed(s.conn.RemoteAddr(), arg) {
+			s.monitor = true
+		}
+		s.reply(200, "Client name noted")
 	case "OPTS":
 		s.reply(200, "OK")
 	case "PWD", "XPWD":
@@ -1467,6 +1480,15 @@ func (s *session) loginLimitKey() string {
 }
 
 func (s *session) logActivity(action, outcome, pathValue, destPath string, bytes int64, detail string) {
+	if s.monitor && outcome == "ok" {
+		// A successful cleanup is the end-to-end monitor signal. Keep one per
+		// hour and discard intermediate login/mkdir/upload/download successes.
+		// Failures are never coalesced.
+		if action != "delete" || !s.server.monitorSuccessDue() {
+			return
+		}
+		detail = "FTP monitor cycle completed"
+	}
 	actor := s.username
 	if s.user.Username != "" {
 		actor = s.user.Username
@@ -1486,6 +1508,32 @@ func (s *session) logActivity(action, outcome, pathValue, destPath string, bytes
 		Bytes:    bytes,
 		Detail:   detail,
 	})
+}
+
+func monitorClientAllowed(remote net.Addr, name string) bool {
+	if !strings.EqualFold(strings.TrimSpace(name), monitorClientName) || remote == nil {
+		return false
+	}
+	if tcp, ok := remote.(*net.TCPAddr); ok {
+		return tcp.IP.IsLoopback()
+	}
+	host, _, err := net.SplitHostPort(remote.String())
+	if err != nil {
+		host = remote.String()
+	}
+	ip := net.ParseIP(strings.Trim(host, "[]"))
+	return ip != nil && ip.IsLoopback()
+}
+
+func (s *Server) monitorSuccessDue() bool {
+	s.monitorMu.Lock()
+	defer s.monitorMu.Unlock()
+	now := time.Now()
+	if !s.monitorLast.IsZero() && now.Sub(s.monitorLast) < monitorSuccessInterval {
+		return false
+	}
+	s.monitorLast = now
+	return true
 }
 
 func (s *session) updateStatus(mutate func(*status.Session)) {

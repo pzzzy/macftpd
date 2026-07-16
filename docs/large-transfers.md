@@ -10,6 +10,8 @@ The request history contained several failures at roughly 60 seconds followed by
 
 Media clients commonly request a small tail range to inspect container metadata. macftpd records a partial response as a completed download only when it reaches EOF and transfers a meaningful amount: one percent of the object, capped at 8 MiB. A tiny tail probe therefore does not inflate download counts, while a substantial resume that completes the object does.
 
+If a browser, media player, or tunnel closes a response before it finishes, macftpd records the transfer as `canceled`. The byte count and range remain in the event for diagnosis, but the weekly report keeps these client-side interruptions separate from server failures.
+
 ## Integrity checks
 
 For an end-to-end transfer test, compare the byte count and SHA-256 digest at the source and destination:
@@ -46,4 +48,6 @@ Stale chunk parts older than 24 hours are cleaned opportunistically. The upload,
 - Confirm sufficient free space for the incoming staged file and, on overwrite, one retained copy of the previous destination.
 - Compare the final byte count and digest for release or incident validation.
 - Treat tiny EOF range requests as media probes; use the activity detail, status, bytes, and range fields to distinguish them from completed transfers.
+- Review `Client Cancellations` separately from `Failures` in the weekly report. Repeated cancellations at a consistent duration can still reveal a proxy or timeout problem, but isolated broken pipes and resets normally mean the client stopped reading.
+- The loopback FTP monitor identifies itself with `CLNT macftpd-monitor`. Intermediate successful probe actions are suppressed, one completed cycle is retained per hour, and every failed action is retained.
 - When Cloudflare caching is enabled, configure a cache tag and public base URL. Public mutations purge the tag; HTTP mutations fall back to exact object and parent-listing URLs.
