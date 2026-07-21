@@ -52,6 +52,7 @@ remote_file = f"{remote_dir}/{stamp}.txt"
 
 ftp = ftplib.FTP()
 ftp.connect(host, port, timeout=20)
+ftp.sendcmd("CLNT macftpd-monitor")
 ftp.login(user, password)
 try:
     ftp.mkd(remote_dir)

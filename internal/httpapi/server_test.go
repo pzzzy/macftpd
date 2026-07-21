@@ -3,6 +3,7 @@ package httpapi
 import (
 	"bytes"
 	"encoding/json"
+	"errors"
 	"html/template"
 	"mime/multipart"
 	"net/http"
@@ -11,6 +12,7 @@ import (
 	"os"
 	"strconv"
 	"strings"
+	"syscall"
 	"testing"
 	"time"
 
@@ -51,6 +53,35 @@ func TestTinyTailProbeDoesNotCountAsCompletedLargeDownload(t *testing.T) {
 	completedResume := fileServeResult{Status: http.StatusPartialContent, Bytes: 168_078_615, Size: size, Method: http.MethodGet, Range: "bytes=10656005173-"}
 	if !completedResume.RecordableDownload() {
 		t.Fatal("substantial resume through EOF was not counted as a completed download")
+	}
+}
+
+func TestClientDisconnectsAreCanceledRatherThanFailed(t *testing.T) {
+	for _, tc := range []struct {
+		name string
+		err  error
+		want bool
+	}{
+		{name: "broken pipe", err: syscall.EPIPE, want: true},
+		{name: "reset", err: syscall.ECONNRESET, want: true},
+		{name: "HTTP/2 cancel", err: errors.New("stream error: stream ID 7; CANCEL"), want: true},
+		{name: "storage failure", err: errors.New("storage read failed"), want: false},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			if got := isClientDisconnect(tc.err); got != tc.want {
+				t.Fatalf("isClientDisconnect(%v) = %v, want %v", tc.err, got, tc.want)
+			}
+		})
+	}
+
+	srv := testServer(t)
+	srv.logDownloadActivity(activity.Event{
+		Type: "share_download", Protocol: "http", Actor: "share-link",
+		Action: "download", Path: "/public/movie.mkv", Detail: "public share download",
+	}, fileServeResult{Status: http.StatusOK, Bytes: 4 << 20, Method: http.MethodGet, Err: syscall.EPIPE})
+	events := srv.activity.Recent(10, 0)
+	if len(events) != 1 || events[0].Outcome != "canceled" || !strings.Contains(events[0].Message, "canceled") || isSecurityActivity(events[0]) {
+		t.Fatalf("client disconnect was not recorded as a non-failure cancellation: %#v", events)
 	}
 }
 
@@ -269,6 +300,69 @@ func TestActivityDashboardSuppressesMonitorAndSeparatesSecurity(t *testing.T) {
 	}
 	if strings.Contains(rendered, "_monitor/probe.txt") {
 		t.Fatalf("activity partial leaked monitor path: %s", rendered)
+	}
+}
+
+func TestActivityDashboardScansPastMonitorFlood(t *testing.T) {
+	srv := testServer(t)
+	srv.activity = activity.New(2000)
+	human := srv.activity.Add(activity.Event{Type: "admin_file", Protocol: "http", Actor: "admin", Action: "copy", Path: "/public/important.txt"})
+	for i := 0; i < 700; i++ {
+		srv.activity.Add(activity.Event{Type: "ftp_delete", Protocol: "ftp", Actor: "admin", Remote: "127.0.0.1:50000", Action: "delete", Path: "_monitor/probe.txt", Detail: "FTP monitor cleanup"})
+	}
+
+	dashboard := srv.activityDashboard(20, 0)
+	if dashboard.Monitor.Count != 700 {
+		t.Fatalf("monitor count = %d, want 700", dashboard.Monitor.Count)
+	}
+	if len(dashboard.Events) != 1 || dashboard.Events[0].ID != human.ID {
+		t.Fatalf("human event was hidden by monitor traffic: %#v", dashboard.Events)
+	}
+}
+
+func TestDoctorReportsOperationalMetadataAndOptionalChecks(t *testing.T) {
+	srv := testServer(t)
+	srv.cfg.WriteTimeout = config.Duration(time.Minute)
+	srv.activity.Add(activity.Event{Action: "test"})
+
+	req := httptest.NewRequest(http.MethodGet, "/api/doctor", nil)
+	req.SetBasicAuth("admin", "secret")
+	rr := httptest.NewRecorder()
+	srv.requireAdmin(srv.doctorAPI)(rr, req)
+	if rr.Code != http.StatusOK {
+		t.Fatalf("doctor status = %d body=%s", rr.Code, rr.Body.String())
+	}
+	var body struct {
+		Checks []struct {
+			Name  string `json:"name"`
+			OK    bool   `json:"ok"`
+			Level string `json:"level"`
+		} `json:"checks"`
+		HTTP     map[string]string `json:"http"`
+		Runtime  map[string]any    `json:"runtime"`
+		Activity activity.State    `json:"activity"`
+	}
+	if err := json.Unmarshal(rr.Body.Bytes(), &body); err != nil {
+		t.Fatalf("decode doctor response: %v", err)
+	}
+	if body.HTTP["write_timeout"] != "1m0s" || body.HTTP["read_timeout"] != "0s" {
+		t.Fatalf("unexpected HTTP timeout metadata: %#v", body.HTTP)
+	}
+	if body.Runtime["go_version"] == "" || body.Runtime["started_at"] == nil {
+		t.Fatalf("missing runtime metadata: %#v", body.Runtime)
+	}
+	if body.Activity.Count != 1 || body.Activity.Capacity != 200 {
+		t.Fatalf("unexpected activity state: %#v", body.Activity)
+	}
+	levels := map[string]string{}
+	for _, check := range body.Checks {
+		if !check.OK {
+			t.Fatalf("non-failing doctor check reported ok=false: %#v", check)
+		}
+		levels[check.Name] = check.Level
+	}
+	if levels["HTTP streaming"] != "warning" || levels["cloudflare client"] != "info" || levels["turnstile"] != "info" {
+		t.Fatalf("unexpected doctor check levels: %#v", levels)
 	}
 }
 

@@ -74,6 +74,7 @@ paths.extend(sorted(var_dir.glob("activity.jsonl.*.gz")))
 counts = collections.Counter()
 monitor_counts = collections.Counter()
 failures = collections.Counter()
+cancellations = collections.Counter()
 monitor_failures = collections.Counter()
 bytes_by_action = collections.Counter()
 paths_by_action = collections.Counter()
@@ -175,7 +176,10 @@ for path in paths:
                         bytes_by_action[action] += int(size or 0)
                 except (TypeError, ValueError):
                     pass
-                if outcome not in ("ok", "success"):
+                if outcome in ("canceled", "cancelled"):
+                    if not monitor and not maintenance:
+                        cancellations[(action, event.get("detail") or "canceled")] += 1
+                elif outcome not in ("ok", "success"):
                     if monitor:
                         monitor_failures[(action, event.get("detail") or "failed")] += 1
                     elif not maintenance:
@@ -201,6 +205,11 @@ for action, size in bytes_by_action.most_common():
 if failures:
     print("\n### Failures\n")
     for (action, detail), count in failures.most_common(10):
+        detail = str(detail).replace("`", "'")
+        print(f"- {action}: `{count}` `{detail[:160]}`")
+if cancellations:
+    print("\n### Client Cancellations\n")
+    for (action, detail), count in cancellations.most_common(10):
         detail = str(detail).replace("`", "'")
         print(f"- {action}: `{count}` `{detail[:160]}`")
 if monitor_counts:

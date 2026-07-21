@@ -13,7 +13,16 @@
         <div class="font-medium">{{index . "name"}}</div>
         <div class="truncate text-xs text-base-content/60">{{index . "detail"}}</div>
       </div>
-      {{if index . "ok"}}<span class="badge badge-success badge-sm">ok</span>{{else}}<span class="badge badge-error badge-sm">fail</span>{{end}}
+      {{$level := index . "level"}}
+      {{if eq $level "fail"}}
+        <span class="badge badge-error badge-sm">fail</span>
+      {{else if eq $level "warning"}}
+        <span class="badge badge-warning badge-sm">warn</span>
+      {{else if eq $level "info"}}
+        <span class="badge badge-ghost badge-sm">optional</span>
+      {{else}}
+        <span class="badge badge-success badge-sm">ok</span>
+      {{end}}
     </div>
   {{end}}
 </div>

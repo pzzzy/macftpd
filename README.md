@@ -171,6 +171,8 @@ curl "${auth[@]}" 'https://ftp.example.com/api/stats?path=/public/example.mp4'
 
 Other admin endpoints include `/api/users`, `/api/groups`, `/api/files`, `/api/files/action`, `/api/upload/chunk`, `/api/download`, `/api/fxp`, `/api/activity`, `/api/status`, `/api/doctor`, `/api/retention`, `/api/retention/restore`, and `/api/cloudflare/purge`.
 
+The authenticated `/api/doctor` response includes build provenance and uptime, effective HTTP timeouts, activity-buffer capacity and age, and individual storage/integration checks. Optional integrations that are disabled are reported as informational rather than failed. The activity dashboard scans the full in-memory history before filtering monitor traffic, so a busy probe loop cannot hide human or security events.
+
 ## Release Gate
 
 Before a release candidate, run:

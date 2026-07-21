@@ -45,7 +45,7 @@ ensure_dir(ftp, "_protocol_lab")
 ensure_dir(ftp, base)
 ftp.voidcmd("TYPE I")
 features = "\n".join(ftp.sendcmd("FEAT").splitlines())
-required = ["UTF8", "PASV", "EPSV", "REST STREAM", "SIZE", "MDTM", "MLSD"]
+required = ["UTF8", "CLNT", "PASV", "EPSV", "REST STREAM", "SIZE", "MDTM", "MLSD"]
 missing = [x for x in required if x not in features]
 if missing:
     raise SystemExit(f"missing FEAT entries: {missing}")

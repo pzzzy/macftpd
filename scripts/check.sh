@@ -31,6 +31,7 @@ go build -o "${build_dir}/macftpd" ./cmd/macftpd
 GOOS=darwin GOARCH=arm64 go build -o "${build_dir}/macftpd-darwin-arm64" ./cmd/macftpd
 
 npm ci
+npm audit --audit-level=high
 cp internal/httpapi/static/macftpd.css internal/httpapi/static/htmx.min.js "${asset_snapshot}/"
 npm run build
 diff -u "${asset_snapshot}/macftpd.css" internal/httpapi/static/macftpd.css
