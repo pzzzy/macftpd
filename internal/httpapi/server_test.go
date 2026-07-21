@@ -303,6 +303,69 @@ func TestActivityDashboardSuppressesMonitorAndSeparatesSecurity(t *testing.T) {
 	}
 }
 
+func TestActivityDashboardScansPastMonitorFlood(t *testing.T) {
+	srv := testServer(t)
+	srv.activity = activity.New(2000)
+	human := srv.activity.Add(activity.Event{Type: "admin_file", Protocol: "http", Actor: "admin", Action: "copy", Path: "/public/important.txt"})
+	for i := 0; i < 700; i++ {
+		srv.activity.Add(activity.Event{Type: "ftp_delete", Protocol: "ftp", Actor: "admin", Remote: "127.0.0.1:50000", Action: "delete", Path: "_monitor/probe.txt", Detail: "FTP monitor cleanup"})
+	}
+
+	dashboard := srv.activityDashboard(20, 0)
+	if dashboard.Monitor.Count != 700 {
+		t.Fatalf("monitor count = %d, want 700", dashboard.Monitor.Count)
+	}
+	if len(dashboard.Events) != 1 || dashboard.Events[0].ID != human.ID {
+		t.Fatalf("human event was hidden by monitor traffic: %#v", dashboard.Events)
+	}
+}
+
+func TestDoctorReportsOperationalMetadataAndOptionalChecks(t *testing.T) {
+	srv := testServer(t)
+	srv.cfg.WriteTimeout = config.Duration(time.Minute)
+	srv.activity.Add(activity.Event{Action: "test"})
+
+	req := httptest.NewRequest(http.MethodGet, "/api/doctor", nil)
+	req.SetBasicAuth("admin", "secret")
+	rr := httptest.NewRecorder()
+	srv.requireAdmin(srv.doctorAPI)(rr, req)
+	if rr.Code != http.StatusOK {
+		t.Fatalf("doctor status = %d body=%s", rr.Code, rr.Body.String())
+	}
+	var body struct {
+		Checks []struct {
+			Name  string `json:"name"`
+			OK    bool   `json:"ok"`
+			Level string `json:"level"`
+		} `json:"checks"`
+		HTTP     map[string]string `json:"http"`
+		Runtime  map[string]any    `json:"runtime"`
+		Activity activity.State    `json:"activity"`
+	}
+	if err := json.Unmarshal(rr.Body.Bytes(), &body); err != nil {
+		t.Fatalf("decode doctor response: %v", err)
+	}
+	if body.HTTP["write_timeout"] != "1m0s" || body.HTTP["read_timeout"] != "0s" {
+		t.Fatalf("unexpected HTTP timeout metadata: %#v", body.HTTP)
+	}
+	if body.Runtime["go_version"] == "" || body.Runtime["started_at"] == nil {
+		t.Fatalf("missing runtime metadata: %#v", body.Runtime)
+	}
+	if body.Activity.Count != 1 || body.Activity.Capacity != 200 {
+		t.Fatalf("unexpected activity state: %#v", body.Activity)
+	}
+	levels := map[string]string{}
+	for _, check := range body.Checks {
+		if !check.OK {
+			t.Fatalf("non-failing doctor check reported ok=false: %#v", check)
+		}
+		levels[check.Name] = check.Level
+	}
+	if levels["HTTP streaming"] != "warning" || levels["cloudflare client"] != "info" || levels["turnstile"] != "info" {
+		t.Fatalf("unexpected doctor check levels: %#v", levels)
+	}
+}
+
 func TestUploadRejectsIgnoredDestination(t *testing.T) {
 	srv := testServer(t)
 	var body bytes.Buffer

@@ -20,6 +20,8 @@ import (
 	"os"
 	"path"
 	"path/filepath"
+	"runtime"
+	"runtime/debug"
 	"sort"
 	"strconv"
 	"strings"
@@ -53,6 +55,7 @@ type Server struct {
 	tracker    *status.Tracker
 	uploadMu   sync.Mutex
 	uploads    map[string]*uploadLock
+	startedAt  time.Time
 }
 
 type uploadLock struct {
@@ -109,7 +112,7 @@ func (r userRequest) user() auth.User {
 }
 
 func New(cfg config.HTTPConfig, store *auth.Store, root *storage.Root, cf *cloudflare.Client, activityLog *activity.Store, links *share.Store, tracker *status.Tracker) *Server {
-	return &Server{cfg: cfg, store: store, root: root, cloudflare: cf, sessionKey: []byte(cfg.SessionKey), limiter: ratelimit.New(5, 10*time.Minute, 5*time.Minute), shareLimit: ratelimit.New(5, 10*time.Minute, 5*time.Minute), activity: activityLog, links: links, tracker: tracker, uploads: map[string]*uploadLock{}}
+	return &Server{cfg: cfg, store: store, root: root, cloudflare: cf, sessionKey: []byte(cfg.SessionKey), limiter: ratelimit.New(5, 10*time.Minute, 5*time.Minute), shareLimit: ratelimit.New(5, 10*time.Minute, 5*time.Minute), activity: activityLog, links: links, tracker: tracker, uploads: map[string]*uploadLock{}, startedAt: time.Now().UTC()}
 }
 
 func (s *Server) ListenAndServe(ctx context.Context) error {
@@ -1878,13 +1881,10 @@ func (s *Server) activityDashboard(limit int, after int64) activityDashboard {
 	if limit <= 0 || limit > 200 {
 		limit = 80
 	}
-	scanLimit := limit * 6
-	if scanLimit < 200 {
-		scanLimit = 200
-	}
-	if scanLimit > 500 {
-		scanLimit = 500
-	}
+	// The production activity buffer holds 2,000 events. Scan it in full so a
+	// burst of monitor or maintenance traffic cannot hide human activity and
+	// security events from the filtered dashboard.
+	const scanLimit = 2000
 	dashboard := activityDashboard{
 		Events:           []activity.Event{},
 		Security:         []activity.Event{},
@@ -2011,32 +2011,100 @@ func (s *Server) doctorAPI(w http.ResponseWriter, r *http.Request, _ principal) 
 		writeJSON(w, http.StatusMethodNotAllowed, errorBody("method not allowed"))
 		return
 	}
-	writeJSON(w, http.StatusOK, map[string]any{"checks": s.doctorChecks(), "time": time.Now().UTC()})
+	payload := map[string]any{
+		"checks":  s.doctorChecks(),
+		"http":    s.doctorHTTPStatus(),
+		"runtime": s.doctorRuntimeStatus(),
+		"time":    time.Now().UTC(),
+	}
+	if s.activity != nil {
+		payload["activity"] = s.activity.State()
+	}
+	writeJSON(w, http.StatusOK, payload)
 }
 
 func (s *Server) doctorChecks() []map[string]any {
 	checks := []map[string]any{}
-	add := func(name string, ok bool, detail string) {
-		checks = append(checks, map[string]any{"name": name, "ok": ok, "detail": detail})
+	add := func(name, level, detail string) {
+		checks = append(checks, map[string]any{"name": name, "ok": level != "fail", "level": level, "detail": detail})
 	}
 	if info, err := os.Stat(s.root.Base); err == nil && info.IsDir() {
-		add("storage root", true, s.root.Base)
+		add("storage root", "ok", s.root.Base)
 	} else {
-		add("storage root", false, fmt.Sprint(err))
+		add("storage root", "fail", fmt.Sprint(err))
 	}
 	for _, dir := range []string{s.root.PublicDir, s.root.DropboxDir, "._macftpd_trash", "._macftpd_versions"} {
 		real := filepath.Join(s.root.Base, dir)
 		if err := os.MkdirAll(real, 0o750); err != nil {
-			add("storage "+dir, false, err.Error())
+			add("storage "+dir, "fail", err.Error())
 		} else {
-			add("storage "+dir, true, real)
+			add("storage "+dir, "ok", real)
 		}
 	}
-	add("cloudflare client", s.cloudflare.Enabled(), "configured="+strconv.FormatBool(s.cloudflare.Enabled()))
-	add("share store", s.links != nil, strconv.Itoa(len(s.links.List()))+" links")
-	add("activity store", s.activity != nil, "ready")
-	add("turnstile", s.cfg.TurnstileSecret != "", "configured="+strconv.FormatBool(s.cfg.TurnstileSecret != ""))
+	cloudflareLevel := "info"
+	if s.cloudflare.Enabled() {
+		cloudflareLevel = "ok"
+	}
+	add("cloudflare client", cloudflareLevel, "optional; configured="+strconv.FormatBool(s.cloudflare.Enabled()))
+	if s.links == nil {
+		add("share store", "fail", "unavailable")
+	} else {
+		add("share store", "ok", strconv.Itoa(len(s.links.List()))+" links")
+	}
+	if s.activity == nil {
+		add("activity store", "fail", "unavailable")
+	} else {
+		state := s.activity.State()
+		detail := fmt.Sprintf("%d/%d events", state.Count, state.Capacity)
+		if !state.OldestTime.IsZero() {
+			detail += "; oldest=" + state.OldestTime.UTC().Format(time.RFC3339)
+		}
+		add("activity store", "ok", detail)
+	}
+	streamLevel := "ok"
+	if s.cfg.ReadTimeout != 0 || s.cfg.WriteTimeout != 0 {
+		streamLevel = "warning"
+	}
+	add("HTTP streaming", streamLevel, fmt.Sprintf("read_timeout=%s write_timeout=%s", time.Duration(s.cfg.ReadTimeout), time.Duration(s.cfg.WriteTimeout)))
+	turnstileLevel := "info"
+	if s.cfg.TurnstileSecret != "" {
+		turnstileLevel = "ok"
+	}
+	add("turnstile", turnstileLevel, "optional; configured="+strconv.FormatBool(s.cfg.TurnstileSecret != ""))
 	return checks
+}
+
+func (s *Server) doctorHTTPStatus() map[string]string {
+	return map[string]string{
+		"read_header_timeout": s.cfg.ReadHeaderTimeout.Std(10 * time.Second).String(),
+		"read_timeout":        time.Duration(s.cfg.ReadTimeout).String(),
+		"write_timeout":       time.Duration(s.cfg.WriteTimeout).String(),
+		"idle_timeout":        s.cfg.IdleTimeout.Std(60 * time.Second).String(),
+	}
+}
+
+func (s *Server) doctorRuntimeStatus() map[string]any {
+	status := map[string]any{
+		"go_version": runtime.Version(),
+		"started_at": s.startedAt,
+	}
+	if !s.startedAt.IsZero() {
+		status["uptime_seconds"] = int64(time.Since(s.startedAt).Seconds())
+	}
+	if info, ok := debug.ReadBuildInfo(); ok {
+		status["module_version"] = info.Main.Version
+		for _, setting := range info.Settings {
+			switch setting.Key {
+			case "vcs.revision":
+				status["vcs_revision"] = setting.Value
+			case "vcs.time":
+				status["vcs_time"] = setting.Value
+			case "vcs.modified":
+				status["vcs_modified"] = setting.Value == "true"
+			}
+		}
+	}
+	return status
 }
 
 func (s *Server) sharesAPI(w http.ResponseWriter, r *http.Request, p principal) {

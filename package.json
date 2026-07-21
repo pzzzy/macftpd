@@ -3,7 +3,10 @@
     "daisyui": "^4.12.24",
     "htmx.org": "^2.0.10",
     "tailwindcss": "^3.4.19",
-    "wrangler": "4.110.0"
+    "wrangler": "4.113.0"
+  },
+  "overrides": {
+    "sharp": "0.35.3"
   },
   "scripts": {
     "build:css": "tailwindcss -i ./internal/httpapi/assets/app.css -o ./internal/httpapi/static/macftpd.css --minify",

@@ -36,6 +36,15 @@ type PathStats struct {
 	Recent         []Event        `json:"recent,omitempty"`
 }
 
+type State struct {
+	Count      int       `json:"count"`
+	Capacity   int       `json:"capacity"`
+	OldestID   int64     `json:"oldest_id,omitempty"`
+	NewestID   int64     `json:"newest_id,omitempty"`
+	OldestTime time.Time `json:"oldest_time,omitempty"`
+	NewestTime time.Time `json:"newest_time,omitempty"`
+}
+
 type Store struct {
 	mu     sync.RWMutex
 	nextID int64
@@ -107,7 +116,7 @@ func (s *Store) Recent(limit int, afterID int64) []Event {
 	if s == nil {
 		return nil
 	}
-	if limit <= 0 || limit > 500 {
+	if limit <= 0 {
 		limit = 100
 	}
 	s.mu.RLock()
@@ -121,6 +130,25 @@ func (s *Store) Recent(limit int, afterID int64) []Event {
 		out = append(out, e)
 	}
 	return out
+}
+
+func (s *Store) State() State {
+	if s == nil {
+		return State{}
+	}
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+	state := State{Count: len(s.events), Capacity: s.limit}
+	if len(s.events) == 0 {
+		return state
+	}
+	oldest := s.events[0]
+	newest := s.events[len(s.events)-1]
+	state.OldestID = oldest.ID
+	state.NewestID = newest.ID
+	state.OldestTime = oldest.Time
+	state.NewestTime = newest.Time
+	return state
 }
 
 func (s *Store) StatsForPath(path string, limit int) PathStats {
