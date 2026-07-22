@@ -40,10 +40,10 @@ PY
     printf -- '- local_http: failed `%s`\n' "$(cat /tmp/macftpd-weekly-health-err.$$ 2>/dev/null || true)"
   fi
   rm -f /tmp/macftpd-weekly-health.$$ /tmp/macftpd-weekly-health-err.$$
-  if command -v cloudflared >/dev/null 2>&1; then
-    printf -- '- system_cloudflared: `%s`\n' "$(cloudflared --version 2>/dev/null || true)"
-  elif [[ -x "${APP_DIR}/bin/cloudflared" ]]; then
+  if [[ -x "${APP_DIR}/bin/cloudflared" ]]; then
     printf -- '- bundled_cloudflared: `%s`\n' "$("${APP_DIR}/bin/cloudflared" --version 2>/dev/null || true)"
+  elif command -v cloudflared >/dev/null 2>&1; then
+    printf -- '- system_cloudflared: `%s`\n' "$(cloudflared --version 2>/dev/null || true)"
   fi
   if [[ -x "${APP_DIR}/bin/macftpd" ]]; then
     printf -- '- bundled_macftpd: present\n'

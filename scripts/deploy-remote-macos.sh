@@ -98,17 +98,45 @@ set -euo pipefail
 REMOTE_DIR="${REMOTE_DIR:-/opt/macftpd}"
 sign_macftpd() {
   local binary="$1"
-  if ! command -v codesign >/dev/null 2>&1; then
-    return 0
-  fi
   local identity="${MACFTPD_CODESIGN_IDENTITY:-}"
   local keychain="${MACFTPD_CODESIGN_KEYCHAIN:-}"
   local pass_file="${MACFTPD_CODESIGN_KEYCHAIN_PASS_FILE:-}"
+  local stable_requested=false
+  if [[ -n "${identity}" || -n "${keychain}" || -n "${pass_file}" ]]; then
+    stable_requested=true
+  fi
+  if ! command -v codesign >/dev/null 2>&1; then
+    if [[ "${stable_requested}" == true ]]; then
+      echo "error: stable codesigning was requested, but codesign is unavailable" >&2
+      return 1
+    fi
+    return 0
+  fi
   local keychain_args=()
   if [[ -n "${keychain}" ]]; then
     keychain_args=(--keychain "${keychain}")
     if [[ -n "${pass_file}" && -f "${pass_file}" ]]; then
-      security unlock-keychain -p "$(cat "${pass_file}")" "${keychain}" >/dev/null 2>&1 || true
+      local keychain_pass
+      keychain_pass="$(cat "${pass_file}")"
+      security unlock-keychain -p "${keychain_pass}" "${keychain}"
+      security set-key-partition-list -S apple-tool:,apple:,codesign: -s -k "${keychain_pass}" "${keychain}" >/dev/null
+    fi
+
+    local search_output entry found=false
+    local -a search_list=()
+    search_output="$(security list-keychains -d user)"
+    while IFS= read -r entry; do
+      entry="${entry#"${entry%%[![:space:]]*}"}"
+      entry="${entry#\"}"
+      entry="${entry%\"}"
+      [[ -n "${entry}" ]] || continue
+      search_list+=("${entry}")
+      if [[ "${entry}" == "${keychain}" ]]; then
+        found=true
+      fi
+    done <<<"${search_output}"
+    if [[ "${found}" != true ]]; then
+      security list-keychains -d user -s "${search_list[@]}" "${keychain}"
     fi
   fi
   if [[ -z "${identity}" && -n "${keychain}" ]]; then
@@ -116,20 +144,26 @@ sign_macftpd() {
   fi
   if [[ -n "${identity}" ]]; then
     if codesign --force --sign "${identity}" "${keychain_args[@]}" --identifier org.rememe.macftpd "${binary}"; then
-      return 0
+      if codesign --verify --strict --verbose=2 "${binary}"; then
+        return 0
+      fi
     fi
-    echo "warning: stable codesign identity failed; falling back to ad-hoc signing" >&2
-  else
-    echo "warning: no stable codesign identity configured; ad-hoc signing may retrigger macOS removable-volume prompts after each upgrade" >&2
+    echo "error: stable codesign identity failed; refusing to replace the deployed binary" >&2
+    return 1
   fi
+  if [[ "${stable_requested}" == true ]]; then
+    echo "error: stable codesigning was requested, but no valid identity was found" >&2
+    return 1
+  fi
+  echo "warning: no stable codesign identity configured; ad-hoc signing may retrigger macOS removable-volume prompts after each upgrade" >&2
   codesign --force --sign - --identifier org.rememe.macftpd "${binary}"
 }
 chmod 755 "${REMOTE_DIR}/bin/macftpd.new"
+sign_macftpd "${REMOTE_DIR}/bin/macftpd.new"
 if [[ -f "${REMOTE_DIR}/bin/macftpd" ]]; then
   cp "${REMOTE_DIR}/bin/macftpd" "${REMOTE_DIR}/bin/macftpd.prev.$(date -u +%Y%m%dT%H%M%SZ)"
 fi
 mv "${REMOTE_DIR}/bin/macftpd.new" "${REMOTE_DIR}/bin/macftpd"
-sign_macftpd "${REMOTE_DIR}/bin/macftpd"
 if [[ ! -f "${REMOTE_DIR}/config.json" ]]; then
   mv "${REMOTE_DIR}/config.json.new" "${REMOTE_DIR}/config.json"
 else

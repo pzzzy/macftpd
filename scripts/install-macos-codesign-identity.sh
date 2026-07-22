@@ -23,6 +23,23 @@ if [[ ! -f "${KEYCHAIN}" ]]; then
 fi
 security unlock-keychain -p "${PASS}" "${KEYCHAIN}"
 
+search_output="$(security list-keychains -d user)"
+search_list=()
+found=false
+while IFS= read -r entry; do
+  entry="${entry#"${entry%%[![:space:]]*}"}"
+  entry="${entry#\"}"
+  entry="${entry%\"}"
+  [[ -n "${entry}" ]] || continue
+  search_list+=("${entry}")
+  if [[ "${entry}" == "${KEYCHAIN}" ]]; then
+    found=true
+  fi
+done <<<"${search_output}"
+if [[ "${found}" != true ]]; then
+  security list-keychains -d user -s "${search_list[@]}" "${KEYCHAIN}"
+fi
+
 cat >"${OPENSSL_CONFIG}" <<EOF
 [ req ]
 distinguished_name = dn
@@ -51,8 +68,8 @@ if ! security find-identity -v -p codesigning "${KEYCHAIN}" | grep -F "\"${SIGN_
     -password "pass:${PASS}" \
     -name "${SIGN_NAME}" >/dev/null 2>&1
   security import "${P12}" -k "${KEYCHAIN}" -P "${PASS}" -T /usr/bin/codesign >/dev/null
-  security set-key-partition-list -S apple-tool:,apple: -s -k "${PASS}" "${KEYCHAIN}" >/dev/null 2>&1 || true
 fi
+security set-key-partition-list -S apple-tool:,apple:,codesign: -s -k "${PASS}" "${KEYCHAIN}" >/dev/null
 
 if ! security find-identity -v -p codesigning "${KEYCHAIN}" | grep -F "\"${SIGN_NAME}\"" >/dev/null 2>&1; then
   cat >&2 <<EOF
