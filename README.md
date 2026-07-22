@@ -73,7 +73,7 @@ MACFTPD_CODESIGN_KEYCHAIN_PASS_FILE='/opt/macftpd/var/macftpd-codesign.keychain.
 ./scripts/deploy-remote-macos.sh
 ```
 
-Run the installer on the remote Mac itself. It prints the three values needed by the deploy script. If no stable identity is configured, deploy falls back to ad-hoc signing and warns that macOS may ask for removable-volume access again after a binary replacement.
+Run the installer on the remote Mac itself. It prints the three values needed by the deploy script. The installer registers its custom keychain in the user search list and grants `codesign` access to the private key. If macOS asks for an interactive trust approval, use the exact case-sensitive `trustRoot` and `codeSign` values printed by the installer. When any stable-signing option is configured, deployment signs and verifies the staged binary before replacing the active one and fails closed if the identity cannot be used. Ad-hoc signing is retained only for deploys with no stable identity configured and may cause macOS to ask for removable-volume access again after a binary replacement.
 
 Override `REMOTE_DIR` and `STORAGE_ROOT` for site-specific installs, for example a home-directory app folder with an external-volume FTP root:
 
@@ -96,6 +96,8 @@ ADMIN_PASS='same-password' ./scripts/smoke-remote.sh
 ADMIN_PASS='same-password' HOST=192.0.2.10 ./scripts/protocol-lab.sh
 ```
 
+Prefer a numeric LAN IPv4 address for the protocol lab when `.local` resolution exposes both link-local IPv6 and IPv4 routes. The lab intentionally exercises a long-lived FTP control connection, so a lossy link-local route can fail even while loopback monitoring and the IPv4 service are healthy.
+
 ## Cloudflare HTTP Front Door
 
 `https://ftp.example.com` is served through Cloudflare Tunnel and a Worker:
@@ -112,6 +114,13 @@ TUNNEL_TOKEN_FILE=/path/to/token ./scripts/start-cloudflare-tunnel.sh
 ```
 
 The token is stored on the remote Mac at `/opt/macftpd/var/cloudflared.env.token` with mode `0600`, and the screen session is `macftpd-cloudflared`.
+
+Upgrade the bundled connector with the release-pinned, checksum-verified helper. A remote upgrade keeps a timestamped previous binary and restarts only the connector LaunchAgent:
+
+```bash
+REMOTE='macftpd@example-host.local' KEY='/path/to/ssh-key' \
+REMOTE_DIR='/opt/macftpd' ./scripts/upgrade-cloudflared.sh
+```
 
 Deploy or repair the Worker route:
 
